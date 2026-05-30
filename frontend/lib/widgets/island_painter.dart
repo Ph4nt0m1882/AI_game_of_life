@@ -74,7 +74,7 @@ class _InteractiveIslandPainterWidgetState extends State<InteractiveIslandPainte
             color: const Color(0xFF0D47A1),
           ),
           child: GestureDetector(
-            onTapDown: widget.activeTool == 'pan' ? null : (details) {
+            onTapDown: (details) {
               _handleGesture(details.localPosition, false);
             },
             onPanStart: isPainting

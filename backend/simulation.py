@@ -207,6 +207,7 @@ class Simulation:
             comp = cls(x, y, atb_vitesse=atb_vitesse)
         else:
             comp = cls(x, y)
+        comp.type_id = type_id
             
         meta = next((m for m in METADATA_REGISTRY if m["id"] == type_id), None)
         if meta:
@@ -240,6 +241,25 @@ class Simulation:
                         comp.noyade_ticks = 0
             self.nettoyer_morts()
 
+    def get_global_stats(self):
+        """Retourne des statistiques globales sur la simulation."""
+        type_counts = {}
+        for c in self.composants.values():
+            if c.vivant:
+                type_counts[c.type_nom] = type_counts.get(c.type_nom, 0) + 1
+                
+        total_cells = self.width * self.height
+        land_cells = sum(row.count(1) for row in self.grille)
+        water_cells = total_cells - land_cells
+        
+        return {
+            "Total d'Entités": len(self.composants),
+            "Répartition": type_counts,
+            "Terre": f"{land_cells} cases ({land_cells/total_cells*100:.1f}%)",
+            "Eau": f"{water_cells} cases ({water_cells/total_cells*100:.1f}%)",
+            "Taille de la Grille": f"{self.width}x{self.height}",
+        }
+
     def get_state(self):
         return {
             "tick": self.scheduler.tick_count,
@@ -247,5 +267,6 @@ class Simulation:
             "height": self.height,
             "grille": self.grille,
             "noyade_active": self.noyade_active,
-            "composants": [c.to_dict() for c in self.composants.values()]
+            "composants": [c.to_dict() for c in self.composants.values()],
+            "global_stats": self.get_global_stats()
         }

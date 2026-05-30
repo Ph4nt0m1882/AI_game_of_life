@@ -84,6 +84,7 @@ def load_class_from_file(comp_id: str, file_path: Path):
     for name in dir(module):
         obj = getattr(module, name)
         if isinstance(obj, type) and issubclass(obj, Composant) and obj is not Composant:
+            obj.type_id = comp_id
             return obj
     return None
 

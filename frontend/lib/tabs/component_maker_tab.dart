@@ -65,6 +65,14 @@ class MonComposant(Composant):
             
         # Exemple de couleur dynamique : changer de couleur de façon aléatoire à chaque tick d'action
         # self.couleur = random.choice(["#FF0000", "#00FF00", "#0000FF", "#FFFF00"])
+
+    def stats(self):
+        """Retourne des statistiques spécifiques affichées dans l'inspecteur."""
+        return {
+            "Statut": ("Actif", "string"),
+            "Énergie": (100, "percent"),
+            "Position": (f"({self.x}, {self.y})", "position")
+        }
 ''');
 
   // Gestion des interactions

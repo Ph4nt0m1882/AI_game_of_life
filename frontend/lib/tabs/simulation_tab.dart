@@ -25,6 +25,12 @@ class _SimulationTabState extends State<SimulationTab> {
   Timer? _listTimer;
   Map<String, dynamic>? _gameState;
   bool _isRunning = false;
+  
+  // États pour le volet de statistiques
+  bool _showStatsPanel = false;
+  String? _selectedStatsComponentId;
+  Map<String, dynamic>? _cachedComponentStats;
+  bool _selectedComponentAlive = true;
 
   final Map<String, ui.Image> _iconCache = {};
 
@@ -117,6 +123,20 @@ class _SimulationTabState extends State<SimulationTab> {
         setState(() {
           _gameState = state;
           _noyadeActive = state['noyade_active'] ?? true;
+          
+          if (_selectedStatsComponentId != null) {
+            final List<dynamic> comps = state['composants'] ?? [];
+            final selected = comps.firstWhere(
+              (c) => c['id'] == _selectedStatsComponentId,
+              orElse: () => null,
+            );
+            if (selected != null) {
+              _cachedComponentStats = selected;
+              _selectedComponentAlive = selected['vivant'] ?? true;
+            } else {
+              _selectedComponentAlive = false;
+            }
+          }
         });
       }
     } catch (e) {
@@ -208,7 +228,27 @@ class _SimulationTabState extends State<SimulationTab> {
   Future<void> _handleCellTap(int x, int y) async {
     if (_selectedSimId == null) return;
     
-    if (_activeTool == 'place') {
+    if (_activeTool == 'pan') {
+      if (_gameState != null && _gameState!['composants'] != null) {
+        final List<dynamic> comps = _gameState!['composants'];
+        final clicked = comps.firstWhere(
+          (c) => c['x'] == x && c['y'] == y,
+          orElse: () => null,
+        );
+        setState(() {
+          if (clicked != null) {
+            _selectedStatsComponentId = clicked['id'];
+            _cachedComponentStats = clicked;
+            _selectedComponentAlive = clicked['vivant'] ?? true;
+            _showStatsPanel = true;
+          } else {
+            _selectedStatsComponentId = null;
+            _cachedComponentStats = null;
+            _selectedComponentAlive = true;
+          }
+        });
+      }
+    } else if (_activeTool == 'place') {
       if (_selectedComponentId == null) return;
       try {
         final response = await ApiClient.addComponent(_selectedSimId!, _selectedComponentId!, x, y);
@@ -773,44 +813,583 @@ def generer_grille(width, height):
               elevation: 4,
               shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
               clipBehavior: Clip.antiAlias,
-              child: Container(
-                decoration: const BoxDecoration(
-                  image: DecorationImage(
-                    image: AssetImage('assets/fond.png'),
-                    fit: BoxFit.cover,
-                  ),
-                ),
-                padding: const EdgeInsets.all(16.0),
-                child: _gameState == null
-                    ? const Center(
-                        child: Text(
-                          "Sélectionnez ou créez un monde pour démarrer la simulation",
-                          style: TextStyle(
-                            color: Colors.white,
-                            fontSize: 16,
-                            fontWeight: FontWeight.bold,
-                            shadows: [
-                              Shadow(
-                                offset: Offset(1.0, 1.0),
-                                blurRadius: 4.0,
-                                color: Colors.black,
-                              ),
-                            ],
-                          ),
-                          textAlign: TextAlign.center,
-                        ),
-                      )
-                    : InteractiveIslandPainterWidget(
-                        gameState: _gameState!,
-                        onTapCell: _handleCellTap,
-                        onPaintCell: _handleCellPaint,
-                        iconCache: _iconCache,
-                        activeTool: _activeTool,
+              child: Stack(
+                children: [
+                  Container(
+                    decoration: const BoxDecoration(
+                      image: DecorationImage(
+                        image: AssetImage('assets/fond.png'),
+                        fit: BoxFit.cover,
                       ),
+                    ),
+                    padding: const EdgeInsets.all(16.0),
+                    child: _gameState == null
+                        ? const Center(
+                            child: Text(
+                              "Sélectionnez ou créez un monde pour démarrer la simulation",
+                              style: TextStyle(
+                                color: Colors.white,
+                                fontSize: 16,
+                                fontWeight: FontWeight.bold,
+                                shadows: [
+                                  Shadow(
+                                    offset: Offset(1.0, 1.0),
+                                    blurRadius: 4.0,
+                                    color: Colors.black,
+                                  ),
+                                ],
+                              ),
+                              textAlign: TextAlign.center,
+                            ),
+                          )
+                        : InteractiveIslandPainterWidget(
+                            gameState: _gameState!,
+                            onTapCell: _handleCellTap,
+                            onPaintCell: _handleCellPaint,
+                            iconCache: _iconCache,
+                            activeTool: _activeTool,
+                          ),
+                  ),
+                  // Chevron flottant pour ouvrir le panneau si fermé
+                  if (!_showStatsPanel && _gameState != null)
+                    Positioned(
+                      top: 12,
+                      right: 12,
+                      child: Tooltip(
+                        message: 'Afficher les statistiques',
+                        child: IconButton.filledTonal(
+                          icon: const Icon(Icons.chevron_left),
+                          onPressed: () {
+                            setState(() {
+                              _showStatsPanel = true;
+                            });
+                          },
+                        ),
+                      ),
+                    ),
+                ],
               ),
             ),
           ),
+          // Volet de statistiques latéral droit
+          if (_showStatsPanel && _gameState != null) ...[
+            const SizedBox(width: 16),
+            SizedBox(
+              width: 320,
+              child: _buildStatsPanel(),
+            ),
+          ],
         ],
+      ),
+    );
+  }
+
+  Color _parseHexColor(String hex) {
+    try {
+      String cleanHex = hex.toUpperCase().replaceAll('#', '');
+      if (cleanHex.length == 6) {
+        cleanHex = 'FF$cleanHex';
+      }
+      return Color(int.parse(cleanHex, radix: 16));
+    } catch (e) {
+      return Colors.teal;
+    }
+  }
+
+  IconData _getShapeIcon(String shape) {
+    switch (shape) {
+      case 'cercle':
+        return Icons.circle;
+      case 'triangle':
+      case 'triangle_inverse':
+        return Icons.details;
+      case 'rectangle':
+        return Icons.crop_landscape;
+      case 'carré':
+      default:
+        return Icons.square;
+    }
+  }
+
+  Widget _buildStatsPanel() {
+    if (_gameState == null) return const SizedBox.shrink();
+
+    final bool isComponentMode = _selectedStatsComponentId != null && _cachedComponentStats != null;
+    final bool alive = _selectedComponentAlive;
+
+    final Color cardColor = isComponentMode && !alive
+        ? const Color(0xFF4D1010)
+        : const Color(0xFF0F262A);
+
+    final Color borderColor = isComponentMode && !alive
+        ? Colors.red.shade800
+        : Colors.teal.shade800;
+
+    final comp = _cachedComponentStats;
+    final String colorHex = comp != null ? (comp['couleur'] ?? '#000000') : '#000000';
+    final String shape = comp != null ? (comp['forme'] ?? 'carré').toString().toLowerCase() : 'carré';
+
+    return Card(
+      elevation: 4,
+      color: cardColor,
+      clipBehavior: Clip.antiAlias,
+      shape: RoundedRectangleBorder(
+        borderRadius: BorderRadius.circular(16),
+        side: BorderSide(color: borderColor, width: 1.5),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
+        children: [
+          if (isComponentMode && comp != null) ...[
+            Container(
+              height: 180,
+              width: double.infinity,
+              decoration: BoxDecoration(
+                color: Colors.black26,
+                border: Border(
+                  bottom: BorderSide(color: borderColor, width: 1.5),
+                ),
+              ),
+              child: comp['type_id'] != null
+                  ? Image.network(
+                      '${ApiClient.baseUrl}/api/components/${comp['type_id']}/icon',
+                      fit: BoxFit.cover,
+                      width: double.infinity,
+                      height: 180,
+                      errorBuilder: (context, error, stackTrace) => Container(
+                        color: _parseHexColor(colorHex).withValues(alpha: 0.2),
+                        child: Center(
+                          child: Icon(
+                            _getShapeIcon(shape),
+                            color: _parseHexColor(colorHex),
+                            size: 64,
+                          ),
+                        ),
+                      ),
+                    )
+                  : Container(
+                      color: _parseHexColor(colorHex).withValues(alpha: 0.2),
+                      child: Center(
+                        child: Icon(
+                          _getShapeIcon(shape),
+                          color: _parseHexColor(colorHex),
+                          size: 64,
+                        ),
+                      ),
+                    ),
+            ),
+          ],
+          Padding(
+            padding: const EdgeInsets.only(left: 16.0, right: 16.0, top: 12.0, bottom: 8.0),
+            child: Row(
+              children: [
+                IconButton(
+                  icon: const Icon(Icons.chevron_right, color: Colors.grey),
+                  tooltip: 'Fermer le volet',
+                  onPressed: () {
+                    setState(() {
+                      _showStatsPanel = false;
+                    });
+                  },
+                ),
+                const SizedBox(width: 4),
+                Expanded(
+                  child: Text(
+                    isComponentMode ? 'Inspection' : 'Statistiques',
+                    style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
+                  ),
+                ),
+                if (isComponentMode)
+                  IconButton(
+                    icon: const Icon(Icons.public, size: 20),
+                    tooltip: 'Statistiques globales',
+                    onPressed: () {
+                      setState(() {
+                        _selectedStatsComponentId = null;
+                        _cachedComponentStats = null;
+                        _selectedComponentAlive = true;
+                      });
+                    },
+                  ),
+              ],
+            ),
+          ),
+          const Divider(height: 1),
+          Expanded(
+            child: SingleChildScrollView(
+              padding: const EdgeInsets.all(16.0),
+              child: isComponentMode
+                  ? _buildComponentStatsContent(alive)
+                  : _buildGlobalStatsContent(),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildComponentStatsContent(bool alive) {
+    final comp = _cachedComponentStats!;
+    final String name = comp['type'] ?? 'Composant';
+    final String id = comp['id'] ?? '';
+    final String shortId = id.length > 8 ? id.substring(0, 8) : id;
+
+    final Map<String, dynamic> stats = Map<String, dynamic>.from(comp['stats'] ?? {});
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        Text(
+          name,
+          style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold, color: Colors.tealAccent),
+        ),
+        const SizedBox(height: 4),
+        Text(
+          'ID: $shortId',
+          style: const TextStyle(fontSize: 11, color: Colors.grey),
+        ),
+        const SizedBox(height: 16),
+        if (!alive)
+          Container(
+            padding: const EdgeInsets.symmetric(vertical: 8),
+            decoration: BoxDecoration(
+              color: Colors.red.shade900,
+              borderRadius: BorderRadius.circular(8),
+              border: Border.all(color: Colors.redAccent),
+            ),
+            child: const Text(
+              'MORT / DÉCÉDÉ',
+              style: TextStyle(fontWeight: FontWeight.bold, color: Colors.white, fontSize: 13),
+              textAlign: TextAlign.center,
+            ),
+          )
+        else
+          Container(
+            padding: const EdgeInsets.symmetric(vertical: 8),
+            decoration: BoxDecoration(
+              color: Colors.green.shade900.withValues(alpha: 0.4),
+              borderRadius: BorderRadius.circular(8),
+              border: Border.all(color: Colors.green),
+            ),
+            child: const Text(
+              'ÉTAT : VIVANT',
+              style: TextStyle(fontWeight: FontWeight.bold, color: Colors.greenAccent, fontSize: 12),
+              textAlign: TextAlign.center,
+            ),
+          ),
+        const SizedBox(height: 20),
+        const Text(
+          'Données Spécifiques (Comportement)',
+          style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12, color: Colors.tealAccent),
+        ),
+        const SizedBox(height: 8),
+        if (stats.isNotEmpty)
+          ...stats.entries.map((entry) => _buildRichStatWidget(entry.key, entry.value))
+        else
+          const Padding(
+            padding: EdgeInsets.symmetric(vertical: 16.0),
+            child: Text(
+              'Aucune statistique spécifique renvoyée par logic.py.',
+              style: TextStyle(color: Colors.grey, fontSize: 11, fontStyle: FontStyle.italic),
+              textAlign: TextAlign.center,
+            ),
+          ),
+      ],
+    );
+  }
+
+  Widget _buildRichStatWidget(String label, dynamic rawValue) {
+    dynamic val = rawValue;
+    String type = 'string';
+
+    // Support du format tuple/liste [valeur, type]
+    if (rawValue is List && rawValue.length == 2) {
+      val = rawValue[0];
+      type = rawValue[1].toString().toLowerCase();
+    }
+
+    Widget contentWidget;
+
+    switch (type) {
+      case 'progress_bar':
+        double percentage = 0.0;
+        String textVal = '0/0';
+        if (val is List && val.length == 2) {
+          try {
+            final double current = double.parse(val[0].toString());
+            final double maxVal = double.parse(val[1].toString());
+            if (maxVal > 0) {
+              percentage = (current / maxVal).clamp(0.0, 1.0);
+            }
+            textVal = '${val[0]}/${val[1]}';
+          } catch (_) {}
+        }
+        contentWidget = Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                Text(
+                  label,
+                  style: const TextStyle(color: Colors.grey, fontSize: 12),
+                ),
+                Text(
+                  textVal,
+                  style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 12, color: Colors.tealAccent),
+                ),
+              ],
+            ),
+            const SizedBox(height: 6),
+            ClipRRect(
+              borderRadius: BorderRadius.circular(4),
+              child: LinearProgressIndicator(
+                value: percentage,
+                backgroundColor: Colors.teal.shade900,
+                color: Colors.tealAccent,
+                minHeight: 8,
+              ),
+            ),
+          ],
+        );
+        break;
+
+      case 'percent':
+      case 'percentage':
+        double percentage = 0.0;
+        try {
+          percentage = (double.parse(val.toString()) / 100.0).clamp(0.0, 1.0);
+        } catch (_) {}
+        contentWidget = Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                Text(
+                  label,
+                  style: const TextStyle(color: Colors.grey, fontSize: 12),
+                ),
+                Text(
+                  '$val%',
+                  style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 12, color: Colors.tealAccent),
+                ),
+              ],
+            ),
+            const SizedBox(height: 6),
+            ClipRRect(
+              borderRadius: BorderRadius.circular(4),
+              child: LinearProgressIndicator(
+                value: percentage,
+                backgroundColor: Colors.teal.shade900,
+                color: Colors.tealAccent.shade400,
+                minHeight: 8,
+              ),
+            ),
+          ],
+        );
+        break;
+
+      case 'position':
+        contentWidget = Row(
+          children: [
+            const Icon(Icons.location_on, color: Colors.tealAccent, size: 16),
+            const SizedBox(width: 6),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    label,
+                    style: const TextStyle(color: Colors.grey, fontSize: 10),
+                  ),
+                  Text(
+                    val.toString(),
+                    style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13, color: Colors.white),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        );
+        break;
+
+      case 'int':
+      case 'float':
+      case 'number':
+        contentWidget = Row(
+          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+          children: [
+            Text(
+              label,
+              style: const TextStyle(color: Colors.grey, fontSize: 12),
+            ),
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+              decoration: BoxDecoration(
+                color: Colors.teal.shade900.withValues(alpha: 0.4),
+                borderRadius: BorderRadius.circular(12),
+                border: Border.all(color: Colors.teal.shade800),
+              ),
+              child: Text(
+                val.toString(),
+                style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 12, color: Colors.tealAccent),
+              ),
+            ),
+          ],
+        );
+        break;
+
+      case 'bool':
+      case 'boolean':
+        final bool isTrue = val.toString().toLowerCase() == 'true' || val == true || val == 1;
+        contentWidget = Row(
+          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+          children: [
+            Text(
+              label,
+              style: const TextStyle(color: Colors.grey, fontSize: 12),
+            ),
+            Icon(
+              isTrue ? Icons.check_circle : Icons.cancel,
+              color: isTrue ? Colors.greenAccent : Colors.redAccent,
+              size: 18,
+            ),
+          ],
+        );
+        break;
+
+      case 'string':
+      default:
+        contentWidget = Row(
+          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+          children: [
+            Text(
+              label,
+              style: const TextStyle(color: Colors.grey, fontSize: 12),
+            ),
+            Text(
+              val.toString(),
+              style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 12, color: Colors.white),
+            ),
+          ],
+        );
+        break;
+    }
+
+    return Card(
+      color: Colors.black26,
+      margin: const EdgeInsets.symmetric(vertical: 4),
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+      child: Padding(
+        padding: const EdgeInsets.all(12.0),
+        child: contentWidget,
+      ),
+    );
+  }
+
+  Widget _buildGlobalStatsContent() {
+    final Map<String, dynamic> globalStats = _gameState != null
+        ? Map<String, dynamic>.from(_gameState!['global_stats'] ?? {})
+        : {};
+
+    if (globalStats.isEmpty) {
+      return const Center(
+        child: Text(
+          'Chargement des statistiques...',
+          style: TextStyle(color: Colors.grey),
+        ),
+      );
+    }
+
+    final int totalEntities = globalStats["Total d'Entités"] ?? 0;
+    final String landStr = globalStats["Terre"] ?? '';
+    final String waterStr = globalStats["Eau"] ?? '';
+    final String gridSize = globalStats["Taille de la Grille"] ?? '';
+    final Map<String, dynamic> distribution = Map<String, dynamic>.from(globalStats["Répartition"] ?? {});
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: [
+        const Text(
+          'Environnement',
+          style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13, color: Colors.tealAccent),
+        ),
+        const SizedBox(height: 8),
+        _buildStatItem('Grille théorique', gridSize),
+        _buildStatItem('Biome Terre', landStr),
+        _buildStatItem('Biome Eau', waterStr),
+        const SizedBox(height: 20),
+        const Text(
+          'Population Active',
+          style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13, color: Colors.tealAccent),
+        ),
+        const SizedBox(height: 8),
+        _buildStatItem('Total d\'entités vivantes', totalEntities.toString()),
+        const SizedBox(height: 12),
+        const Text(
+          'Distribution des Espèces',
+          style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12, color: Colors.grey),
+        ),
+        const SizedBox(height: 6),
+        if (distribution.isNotEmpty)
+          ...distribution.entries.map((entry) {
+            return Card(
+              color: Colors.black12,
+              margin: const EdgeInsets.symmetric(vertical: 4),
+              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+              child: ListTile(
+                dense: true,
+                leading: const Icon(Icons.bubble_chart, color: Colors.tealAccent, size: 16),
+                title: Text(
+                  entry.key,
+                  style: const TextStyle(fontWeight: FontWeight.bold),
+                ),
+                trailing: Chip(
+                  label: Text(
+                    entry.value.toString(),
+                    style: const TextStyle(fontSize: 11, fontWeight: FontWeight.bold),
+                  ),
+                  backgroundColor: Colors.teal.shade900,
+                  padding: EdgeInsets.zero,
+                  materialTapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                ),
+              ),
+            );
+          })
+        else
+          const Padding(
+            padding: EdgeInsets.symmetric(vertical: 16.0),
+            child: Text(
+              'Aucune entité vivante sur la carte.',
+              style: TextStyle(color: Colors.grey, fontSize: 11, fontStyle: FontStyle.italic),
+              textAlign: TextAlign.center,
+            ),
+          ),
+      ],
+    );
+  }
+
+  Widget _buildStatItem(String label, String value) {
+    return Card(
+      color: Colors.black26,
+      margin: const EdgeInsets.symmetric(vertical: 4),
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+      child: Padding(
+        padding: const EdgeInsets.symmetric(horizontal: 12.0, vertical: 10.0),
+        child: Row(
+          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+          children: [
+            Text(
+              label,
+              style: const TextStyle(color: Colors.grey, fontSize: 12),
+            ),
+            Text(
+              value,
+              style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 12),
+            ),
+          ],
+        ),
       ),
     );
   }
