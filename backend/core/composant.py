@@ -10,6 +10,8 @@ class Composant:
         self.atb_max = 100
         self.vivant = True
         self.type_nom = "Composant"
+        self.couleur = "#000000"  # Noir par défaut, format hexadécimal
+        self.forme = "carré"  # carré, carré_arrondi, cercle, triangle, triangle_inverse
 
     def update_atb(self):
         """Ajoute de la vitesse à l'ATB. Retourne True si l'action doit être déclenchée."""
@@ -32,5 +34,8 @@ class Composant:
             "type": self.type_nom,
             "x": self.x,
             "y": self.y,
-            "vivant": self.vivant
+            "vivant": self.vivant,
+            "couleur": self.couleur,
+            "forme": self.forme
         }
+

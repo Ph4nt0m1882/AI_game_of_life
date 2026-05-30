@@ -1,7 +1,6 @@
 import math
 import random
 from core.scheduler import Scheduler
-from composants.cellule import Cellule
 
 class Simulation:
     def __init__(self, width=50, height=50):
@@ -33,12 +32,27 @@ class Simulation:
 
     def generer_cellules_initiales(self):
         """Place quelques cellules au centre pour démarrer le jeu."""
+        from core.loader import LOADED_CLASSES
+        type_id = None
+        for k in LOADED_CLASSES.keys():
+            if "cellule" in k.lower():
+                type_id = k
+                break
+        if not type_id and LOADED_CLASSES:
+            type_id = list(LOADED_CLASSES.keys())[0]
+            
+        if not type_id:
+            return
+            
         cx, cy = int(self.width / 2), int(self.height / 2)
         for dx in range(-2, 3):
             for dy in range(-2, 3):
                 if random.random() > 0.5 and self.is_terre(cx+dx, cy+dy):
-                    c = Cellule(cx+dx, cy+dy)
-                    self.ajouter_composant(c)
+                    try:
+                        c = self.creer_composant(type_id, cx+dx, cy+dy)
+                        self.ajouter_composant(c)
+                    except Exception:
+                        pass
 
     def is_terre(self, x, y):
         if 0 <= x < self.width and 0 <= y < self.height:
@@ -66,6 +80,40 @@ class Simulation:
         if not self.get_composant_at(composant.x, composant.y):
             self.composants[composant.id] = composant
             self.grille_entites[(composant.x, composant.y)] = composant
+            return True
+        return False
+
+    def supprimer_composant_at(self, x, y):
+        comp = self.get_composant_at(x, y)
+        if comp:
+            comp.vivant = False
+            if comp.id in self.composants:
+                del self.composants[comp.id]
+            if (x, y) in self.grille_entites:
+                del self.grille_entites[(x, y)]
+            return True
+        return False
+
+    def creer_composant(self, type_id, x, y, atb_vitesse=None):
+        from core.loader import LOADED_CLASSES, METADATA_REGISTRY
+        if type_id not in LOADED_CLASSES:
+            raise ValueError(f"Composant de type '{type_id}' inconnu.")
+        cls = LOADED_CLASSES[type_id]
+        
+        if atb_vitesse is not None:
+            comp = cls(x, y, atb_vitesse=atb_vitesse)
+        else:
+            comp = cls(x, y)
+            
+        meta = next((m for m in METADATA_REGISTRY if m["id"] == type_id), None)
+        if meta:
+            comp.forme = meta.get("forme", getattr(comp, "forme", "carré"))
+            comp.coin = meta.get("coin", getattr(comp, "coin", "droit"))
+            comp.orientation = meta.get("orientation", getattr(comp, "orientation", "standard"))
+            comp.couleur = meta.get("couleur", getattr(comp, "couleur", "#000000"))
+            
+        return comp
+
 
     def nettoyer_morts(self):
         morts = [c for c in self.composants.values() if not c.vivant]
