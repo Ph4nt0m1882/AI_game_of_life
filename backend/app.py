@@ -161,7 +161,31 @@ async def upload_component(file: UploadFile = File(...)):
     try:
         file_bytes = await file.read()
         manifest = import_sssub(file_bytes)
-        return {"status": "success", "metadata": manifest}
+        
+        # Extraire le code logic.py et l'icône icon.png en base64 pour renvoi à l'éditeur
+        import io
+        import zipfile
+        import base64
+        logic_py = ""
+        icon_base64 = ""
+        try:
+            with zipfile.ZipFile(io.BytesIO(file_bytes), 'r') as zip_file:
+                namelist = zip_file.namelist()
+                if "logic.py" in namelist:
+                    with zip_file.open("logic.py") as lf:
+                        logic_py = lf.read().decode("utf-8", errors="ignore")
+                if "icon.png" in namelist:
+                    with zip_file.open("icon.png") as imgf:
+                        icon_base64 = base64.b64encode(imgf.read()).decode("utf-8")
+        except Exception:
+            pass  # Si l'extraction échoue, on renvoie les chaînes vides
+            
+        return {
+            "status": "success",
+            "metadata": manifest,
+            "logic_py": logic_py,
+            "icon_base64": icon_base64
+        }
     except ValueError as ve:
         raise HTTPException(status_code=400, detail=str(ve))
     except Exception as e:

@@ -236,9 +236,40 @@ class MonComposant(Composant):
 
         if (response.statusCode == 200) {
           final data = json.decode(response.body);
+          final meta = data['metadata'] ?? {};
+          final String logicPy = data['logic_py'] ?? '';
+          final String iconBase64 = data['icon_base64'] ?? '';
+
+          setState(() {
+            _nameController.text = meta['name'] ?? '';
+            _descController.text = meta['description'] ?? '';
+            _colorController.text = meta['couleur'] ?? '#008080';
+            _atbSpeed = (meta['atb_vitesse'] ?? 10).toDouble();
+            _selectedForme = meta['forme'] ?? 'carré';
+            _selectedCoin = meta['coin'] ?? 'droit';
+            _selectedOrientation = meta['orientation'] ?? 'standard';
+            _logicController.text = logicPy;
+            if (iconBase64.isNotEmpty) {
+              _selectedIconBytes = base64.decode(iconBase64);
+              _selectedIconName = 'icon.png';
+            } else {
+              _selectedIconBytes = null;
+              _selectedIconName = null;
+            }
+            
+            // Charger les interactions
+            _localInteractions.clear();
+            final rawInteractions = meta['interactions'];
+            if (rawInteractions is Map) {
+              rawInteractions.forEach((key, value) {
+                _localInteractions[key.toString()] = value.toString();
+              });
+            }
+          });
+
           if (mounted) {
             ScaffoldMessenger.of(context).showSnackBar(
-              SnackBar(content: Text('Composant "${data['metadata']['name']}" importé avec succès !'), backgroundColor: Colors.green),
+              SnackBar(content: Text('Composant "${meta['name']}" importé et chargé dans l\'éditeur !'), backgroundColor: Colors.green),
             );
           }
           _fetchExistingComponents();
