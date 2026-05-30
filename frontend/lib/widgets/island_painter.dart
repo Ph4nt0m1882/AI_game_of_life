@@ -1,52 +1,105 @@
 import 'dart:ui' as ui;
 import 'package:flutter/material.dart';
 
-class InteractiveIslandPainterWidget extends StatelessWidget {
+class InteractiveIslandPainterWidget extends StatefulWidget {
   final Map<String, dynamic> gameState;
   final Function(int x, int y) onTapCell;
+  final Function(int x, int y)? onPaintCell;
   final Map<String, ui.Image> iconCache;
+  final String activeTool;
 
   const InteractiveIslandPainterWidget({
     super.key,
     required this.gameState,
     required this.onTapCell,
+    this.onPaintCell,
     required this.iconCache,
+    required this.activeTool,
   });
 
   @override
+  State<InteractiveIslandPainterWidget> createState() => _InteractiveIslandPainterWidgetState();
+}
+
+class _InteractiveIslandPainterWidgetState extends State<InteractiveIslandPainterWidget> {
+  int _lastPaintedX = -1;
+  int _lastPaintedY = -1;
+
+  void _handleGesture(Offset localPosition, bool isDrag) {
+    final int width = widget.gameState['width'] ?? 80;
+    final int height = widget.gameState['height'] ?? 80;
+    const double cellSize = 24.0;
+
+    final int cellX = (localPosition.dx / cellSize).floor();
+    final int cellY = (localPosition.dy / cellSize).floor();
+
+    if (cellX >= 0 && cellX < width && cellY >= 0 && cellY < height) {
+      if (isDrag) {
+        if (cellX != _lastPaintedX || cellY != _lastPaintedY) {
+          _lastPaintedX = cellX;
+          _lastPaintedY = cellY;
+          if (widget.onPaintCell != null) {
+            widget.onPaintCell!(cellX, cellY);
+          }
+        }
+      } else {
+        _lastPaintedX = cellX;
+        _lastPaintedY = cellY;
+        widget.onTapCell(cellX, cellY);
+      }
+    }
+  }
+
+  @override
   Widget build(BuildContext context) {
-    return LayoutBuilder(
-      builder: (context, constraints) {
-        return GestureDetector(
-          onTapDown: (details) {
-            final int width = gameState['width'] ?? 80;
-            final int height = gameState['height'] ?? 80;
+    final int width = widget.gameState['width'] ?? 80;
+    final int height = widget.gameState['height'] ?? 80;
+    const double cellSize = 24.0;
+    final double canvasWidth = width * cellSize;
+    final double canvasHeight = height * cellSize;
 
-            final double cellWidth = constraints.maxWidth / width;
-            final double cellHeight = constraints.maxHeight / height;
-            final double cellSize = cellWidth < cellHeight ? cellWidth : cellHeight;
+    final bool isPainting = widget.activeTool == 'paint_land' || widget.activeTool == 'paint_water';
 
-            final double offsetX = (constraints.maxWidth - (width * cellSize)) / 2;
-            final double offsetY = (constraints.maxHeight - (height * cellSize)) / 2;
-
-            final double localX = details.localPosition.dx - offsetX;
-            final double localY = details.localPosition.dy - offsetY;
-
-            if (localX >= 0 && localY >= 0) {
-              final int cellX = (localX / cellSize).floor();
-              final int cellY = (localY / cellSize).floor();
-
-              if (cellX >= 0 && cellX < width && cellY >= 0 && cellY < height) {
-                onTapCell(cellX, cellY);
-              }
-            }
-          },
-          child: CustomPaint(
-            size: Size(constraints.maxWidth, constraints.maxHeight),
-            painter: IslandPainter(gameState: gameState, iconCache: iconCache),
+    return Center(
+      child: InteractiveViewer(
+        constrained: false,
+        minScale: 0.1,
+        maxScale: 5.0,
+        boundaryMargin: const EdgeInsets.all(1000),
+        child: Container(
+          width: canvasWidth,
+          height: canvasHeight,
+          decoration: BoxDecoration(
+            border: Border.all(color: const Color(0xFF0A3E85), width: 2),
+            color: const Color(0xFF0D47A1),
           ),
-        );
-      },
+          child: GestureDetector(
+            onTapDown: widget.activeTool == 'pan' ? null : (details) {
+              _handleGesture(details.localPosition, false);
+            },
+            onPanStart: isPainting
+                ? (details) {
+                    _lastPaintedX = -1;
+                    _lastPaintedY = -1;
+                    _handleGesture(details.localPosition, true);
+                  }
+                : null,
+            onPanUpdate: isPainting
+                ? (details) {
+                    _handleGesture(details.localPosition, true);
+                  }
+                : null,
+            child: CustomPaint(
+              size: Size(canvasWidth, canvasHeight),
+              painter: IslandPainter(
+                gameState: widget.gameState,
+                iconCache: widget.iconCache,
+                cellSize: cellSize,
+              ),
+            ),
+          ),
+        ),
+      ),
     );
   }
 }
@@ -54,8 +107,13 @@ class InteractiveIslandPainterWidget extends StatelessWidget {
 class IslandPainter extends CustomPainter {
   final Map<String, dynamic> gameState;
   final Map<String, ui.Image> iconCache;
+  final double cellSize;
 
-  IslandPainter({required this.gameState, required this.iconCache});
+  IslandPainter({
+    required this.gameState,
+    required this.iconCache,
+    required this.cellSize,
+  });
 
   Color _parseHexColor(String hex) {
     try {
@@ -148,22 +206,15 @@ class IslandPainter extends CustomPainter {
     final List<dynamic> grille = gameState['grille'];
     final List<dynamic> composants = gameState['composants'];
 
-    final double cellWidth = size.width / width;
-    final double cellHeight = size.height / height;
-    final double cellSize = cellWidth < cellHeight ? cellWidth : cellHeight;
-    
-    final double offsetX = (size.width - (width * cellSize)) / 2;
-    final double offsetY = (size.height - (height * cellSize)) / 2;
-
-    final Paint waterPaint = Paint()..color = const Color(0xFF001F24);
-    final Paint landPaint = Paint()..color = Colors.teal.shade700;
+    final Paint waterPaint = Paint()..color = const Color(0xFF0D47A1); // Bleu d'origine pour l'eau
+    final Paint landPaint = Paint()..color = const Color(0xFF2E7D32); // Vert d'origine pour l'île
 
     // Dessin de l'île
     for (int y = 0; y < height; y++) {
       for (int x = 0; x < width; x++) {
         final Rect rect = Rect.fromLTWH(
-          offsetX + x * cellSize,
-          offsetY + y * cellSize,
+          x * cellSize,
+          y * cellSize,
           cellSize,
           cellSize,
         );
@@ -171,17 +222,29 @@ class IslandPainter extends CustomPainter {
       }
     }
 
+    // Dessin des voisins / grille de délimitation fine pour faciliter le dessin
+    final Paint gridLinePaint = Paint()
+      ..color = Colors.white.withValues(alpha: 0.15)
+      ..strokeWidth = 0.5
+      ..style = PaintingStyle.stroke;
+
+    for (int i = 0; i <= width; i++) {
+      canvas.drawLine(Offset(i * cellSize, 0), Offset(i * cellSize, height * cellSize), gridLinePaint);
+    }
+    for (int j = 0; j <= height; j++) {
+      canvas.drawLine(Offset(0, j * cellSize), Offset(width * cellSize, j * cellSize), gridLinePaint);
+    }
+
     // Dessin des composants vivants
     for (var comp in composants) {
       if (comp['vivant']) {
         final Rect rect = Rect.fromLTWH(
-          offsetX + comp['x'] * cellSize + 1,
-          offsetY + comp['y'] * cellSize + 1,
+          comp['x'] * cellSize + 1,
+          comp['y'] * cellSize + 1,
           cellSize - 2,
           cellSize - 2,
         );
 
-        // Toujours afficher l'avatar visuel (forme, coin, orientation, couleur) sur la grille de simulation
         final String colorHex = (comp['couleur'] ?? '#000000').toString();
         final String shape = (comp['forme'] ?? 'carré').toString().toLowerCase();
         final String coin = (comp['coin'] ?? 'droit').toString().toLowerCase();

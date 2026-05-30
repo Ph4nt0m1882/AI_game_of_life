@@ -31,6 +31,19 @@ class AddComponentRequest(BaseModel):
 class SettingsRequest(BaseModel):
     data_dir: str
 
+class PaintCellRequest(BaseModel):
+    x: int
+    y: int
+    value: int
+    brush_size: int = 1
+
+class GenerateMapRequest(BaseModel):
+    algorithm: str
+    python_code: str = ""
+
+class SimulationSettingsRequest(BaseModel):
+    noyade_active: bool
+
 
 
 async def simulation_loop():
@@ -193,6 +206,47 @@ def update_settings(req: SettingsRequest):
         return {"status": "success", "data_dir": str(core.loader.CUSTOM_DIR)}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+@app.put("/api/simulations/{sim_id}/map")
+def paint_simulation_map(sim_id: str, req: PaintCellRequest):
+    if sim_id not in simulations:
+        raise HTTPException(status_code=404, detail="Simulation non trouvée")
+    sim = simulations[sim_id]["sim"]
+    success = sim.paint_cell(req.x, req.y, req.value, req.brush_size)
+    if not success:
+        raise HTTPException(status_code=400, detail="Coordonnées en dehors de la grille de l'île")
+    return {"status": "success"}
+
+@app.post("/api/simulations/{sim_id}/generate_map")
+def generate_simulation_map(sim_id: str, req: GenerateMapRequest):
+    if sim_id not in simulations:
+        raise HTTPException(status_code=404, detail="Simulation non trouvée")
+    sim = simulations[sim_id]["sim"]
+    try:
+        sim.generer_ile(req.algorithm, req.python_code)
+        # Supprimer les entités hors grille si la noyade est active
+        if sim.noyade_active:
+            for comp in list(sim.composants.values()):
+                if not sim.is_terre(comp.x, comp.y):
+                    comp.vivant = False
+            sim.nettoyer_morts()
+        return {"status": "success"}
+    except ValueError as ve:
+        raise HTTPException(status_code=400, detail=str(ve))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erreur interne : {str(e)}")
+
+@app.put("/api/simulations/{sim_id}/settings")
+def update_simulation_settings(sim_id: str, req: SimulationSettingsRequest):
+    if sim_id not in simulations:
+        raise HTTPException(status_code=404, detail="Simulation non trouvée")
+    sim = simulations[sim_id]["sim"]
+    sim.noyade_active = req.noyade_active
+    if not sim.noyade_active:
+        sim.grille = [[1] * sim.width for _ in range(sim.height)]
+    else:
+        sim.generer_ile("circular")
+    return {"status": "success", "noyade_active": sim.noyade_active}
 
 if __name__ == "__main__":
     uvicorn.run("app:app", host="0.0.0.0", port=5000, reload=True)

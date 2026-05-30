@@ -157,4 +157,37 @@ class ApiClient {
       throw Exception(errorMsg);
     }
   }
+
+  /// Modifie une cellule de la grille (0: eau, 1: terre)
+  static Future<bool> paintMapCell(String simId, int x, int y, int value, {int brushSize = 1}) async {
+    final response = await http.put(
+      Uri.parse('$baseUrl/api/simulations/$simId/map'),
+      headers: {"Content-Type": "application/json"},
+      body: json.encode({"x": x, "y": y, "value": value, "brush_size": brushSize}),
+    );
+    return response.statusCode == 200;
+  }
+
+  /// Régénère la carte selon l'algorithme choisi
+  static Future<http.Response> generateMap(String simId, String algorithm, {String pythonCode = ""}) async {
+    final response = await http.post(
+      Uri.parse('$baseUrl/api/simulations/$simId/generate_map'),
+      headers: {"Content-Type": "application/json"},
+      body: json.encode({
+        "algorithm": algorithm,
+        "python_code": pythonCode,
+      }),
+    );
+    return response;
+  }
+
+  /// Met à jour les règles de simulation (ex: noyade active)
+  static Future<bool> updateSimulationSettings(String simId, {required bool noyadeActive}) async {
+    final response = await http.put(
+      Uri.parse('$baseUrl/api/simulations/$simId/settings'),
+      headers: {"Content-Type": "application/json"},
+      body: json.encode({"noyade_active": noyadeActive}),
+    );
+    return response.statusCode == 200;
+  }
 }

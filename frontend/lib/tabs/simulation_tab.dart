@@ -18,7 +18,9 @@ class _SimulationTabState extends State<SimulationTab> {
   List<dynamic> _components = [];
   String? _selectedSimId;
   String? _selectedComponentId;
-  bool _isPlacementMode = true; // true: Placer, false: Retirer
+  String _activeTool = 'place'; // 'place', 'remove', 'paint_land', 'paint_water'
+  int _brushSize = 1; // Taille du pinceau (1 = 1x1, 2 = rayon 1, etc.)
+  bool _noyadeActive = true;
   Timer? _pollingTimer;
   Timer? _listTimer;
   Map<String, dynamic>? _gameState;
@@ -91,7 +93,6 @@ class _SimulationTabState extends State<SimulationTab> {
       final fetchedComps = await ApiClient.fetchComponents();
       setState(() {
         _components = fetchedComps;
-        // S'assurer que le composant sélectionné existe toujours
         if (_selectedComponentId == null || !_components.any((c) => c['id'] == _selectedComponentId)) {
           _selectedComponentId = _components.isNotEmpty ? _components.first['id'] : null;
         }
@@ -115,6 +116,7 @@ class _SimulationTabState extends State<SimulationTab> {
       if (mounted) {
         setState(() {
           _gameState = state;
+          _noyadeActive = state['noyade_active'] ?? true;
         });
       }
     } catch (e) {
@@ -152,15 +154,66 @@ class _SimulationTabState extends State<SimulationTab> {
     }
   }
 
+  Future<void> _toggleNoyade(bool value) async {
+    if (_selectedSimId == null) return;
+    try {
+      final success = await ApiClient.updateSimulationSettings(_selectedSimId!, noyadeActive: value);
+      if (success) {
+        setState(() {
+          _noyadeActive = value;
+          if (!_noyadeActive && (_activeTool == 'paint_land' || _activeTool == 'paint_water')) {
+            _activeTool = 'place';
+          }
+        });
+        _fetchGameState();
+      }
+    } catch (e) {
+      // Ignorer
+    }
+  }
+
+  Future<void> _paintCell(int x, int y, int value) async {
+    if (_selectedSimId == null) return;
+    try {
+      final success = await ApiClient.paintMapCell(_selectedSimId!, x, y, value, brushSize: _brushSize);
+      if (success) {
+        setState(() {
+          if (_gameState != null && _gameState!['grille'] != null) {
+            if (_brushSize <= 1) {
+              _gameState!['grille'][y][x] = value;
+            } else {
+              final int width = _gameState!['width'] ?? 80;
+              final int height = _gameState!['height'] ?? 80;
+              final int radius = _brushSize - 1;
+              for (int dy = -radius; dy <= radius; dy++) {
+                for (int dx = -radius; dx <= radius; dx++) {
+                  if (dx * dx + dy * dy <= radius * radius) {
+                    final int px = x + dx;
+                    final int py = y + dy;
+                    if (px >= 0 && px < width && py >= 0 && py < height) {
+                      _gameState!['grille'][py][px] = value;
+                    }
+                  }
+                }
+              }
+            }
+          }
+        });
+      }
+    } catch (e) {
+      // Ignorer
+    }
+  }
+
   Future<void> _handleCellTap(int x, int y) async {
     if (_selectedSimId == null) return;
     
-    if (_isPlacementMode) {
+    if (_activeTool == 'place') {
       if (_selectedComponentId == null) return;
       try {
         final response = await ApiClient.addComponent(_selectedSimId!, _selectedComponentId!, x, y);
         if (response.statusCode == 200) {
-          _fetchGameState(); // Actualisation immédiate
+          _fetchGameState();
         } else {
           final errorMsg = json.decode(response.body)['detail'] ?? 'Erreur';
           if (mounted) {
@@ -172,17 +225,202 @@ class _SimulationTabState extends State<SimulationTab> {
       } catch (e) {
         // Ignorer
       }
-    } else {
-      // Retirer (via endpoint DELETE avec query params)
+    } else if (_activeTool == 'remove') {
       try {
         final success = await ApiClient.removeComponent(_selectedSimId!, x, y);
         if (success) {
-          _fetchGameState(); // Actualisation immédiate
+          _fetchGameState();
         }
       } catch (e) {
         // Ignorer
       }
+    } else if (_activeTool == 'paint_land') {
+      _paintCell(x, y, 1);
+    } else if (_activeTool == 'paint_water') {
+      _paintCell(x, y, 0);
     }
+  }
+
+  void _handleCellPaint(int x, int y) {
+    if (_activeTool == 'paint_land') {
+      _paintCell(x, y, 1);
+    } else if (_activeTool == 'paint_water') {
+      _paintCell(x, y, 0);
+    }
+  }
+
+  void _showGenerateMapDialog() {
+    if (_selectedSimId == null) return;
+    String selectedAlgo = 'circular';
+    final codeController = TextEditingController(text: '''# Script Python de génération
+# Doit contenir la fonction generer_grille(width, height)
+# retournant une matrice 2D de 0 (eau) et 1 (terre).
+
+def generer_grille(width, height):
+    grid = [[0] * width for _ in range(height)]
+    
+    # Exemple : Labyrinthe ou quadrillage
+    for y in range(height):
+        for x in range(width):
+            if (x * y) % 6 == 0 or (x + y) % 9 == 0:
+                grid[y][x] = 1
+                
+    return grid
+''');
+    String dialogError = '';
+    bool isGenerating = false;
+
+    showDialog(
+      context: context,
+      builder: (BuildContext context) {
+        return StatefulBuilder(
+          builder: (context, setDialogState) {
+            return AlertDialog(
+              title: const Text('Générer une Nouvelle Carte'),
+              content: SizedBox(
+                width: 600,
+                child: SingleChildScrollView(
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      InputDecorator(
+                        decoration: const InputDecoration(
+                          labelText: 'Algorithme de Génération',
+                          border: OutlineInputBorder(),
+                          contentPadding: EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                        ),
+                        child: DropdownButtonHideUnderline(
+                          child: DropdownButton<String>(
+                            value: selectedAlgo,
+                            isExpanded: true,
+                            isDense: true,
+                            items: const [
+                              DropdownMenuItem(value: 'circular', child: Text('Île circulaire simple')),
+                              DropdownMenuItem(value: 'organique', child: Text('Île organique (Automate cellulaire)')),
+                              DropdownMenuItem(value: 'custom', child: Text('Script Python personnalisé')),
+                            ],
+                            onChanged: (val) {
+                              if (val != null) {
+                                setDialogState(() {
+                                  selectedAlgo = val;
+                                });
+                              }
+                            },
+                          ),
+                        ),
+                      ),
+                      if (selectedAlgo == 'custom') ...[
+                        const SizedBox(height: 16),
+                        const Text(
+                          'Script Python',
+                          style: TextStyle(fontWeight: FontWeight.bold),
+                        ),
+                        const SizedBox(height: 8),
+                        Container(
+                          height: 300,
+                          decoration: BoxDecoration(
+                            color: Colors.black38,
+                            borderRadius: BorderRadius.circular(8),
+                            border: Border.all(color: Colors.grey.shade800),
+                          ),
+                          child: TextField(
+                            controller: codeController,
+                            maxLines: null,
+                            keyboardType: TextInputType.multiline,
+                            style: const TextStyle(
+                              fontFamily: 'monospace',
+                              fontSize: 12,
+                              color: Colors.greenAccent,
+                            ),
+                            decoration: const InputDecoration(
+                              contentPadding: EdgeInsets.all(12),
+                              border: InputBorder.none,
+                            ),
+                          ),
+                        ),
+                      ],
+                      if (dialogError.isNotEmpty) ...[
+                        const SizedBox(height: 16),
+                        Container(
+                          padding: const EdgeInsets.all(10),
+                          decoration: BoxDecoration(
+                            color: const Color(0x802D0A0A),
+                            borderRadius: BorderRadius.circular(8),
+                            border: Border.all(color: Colors.redAccent),
+                          ),
+                          child: Text(
+                            dialogError,
+                            style: const TextStyle(
+                              color: Colors.redAccent,
+                              fontFamily: 'monospace',
+                              fontSize: 12,
+                            ),
+                          ),
+                        ),
+                      ],
+                    ],
+                  ),
+                ),
+              ),
+              actions: [
+                TextButton(
+                  onPressed: isGenerating ? null : () => Navigator.of(context).pop(),
+                  child: const Text('Annuler'),
+                ),
+                ElevatedButton(
+                  onPressed: isGenerating
+                      ? null
+                      : () async {
+                          setDialogState(() {
+                            isGenerating = true;
+                            dialogError = '';
+                          });
+                          try {
+                            final response = await ApiClient.generateMap(
+                              _selectedSimId!,
+                              selectedAlgo,
+                              pythonCode: selectedAlgo == 'custom' ? codeController.text : '',
+                            );
+                            if (response.statusCode == 200) {
+                              if (context.mounted) {
+                                Navigator.of(context).pop();
+                                ScaffoldMessenger.of(context).showSnackBar(
+                                  const SnackBar(content: Text('Carte générée avec succès !'), backgroundColor: Colors.green),
+                                );
+                              }
+                              _fetchGameState();
+                            } else {
+                              final err = json.decode(response.body)['detail'] ?? 'Erreur';
+                              setDialogState(() {
+                                dialogError = err.toString();
+                              });
+                            }
+                          } catch (e) {
+                            setDialogState(() {
+                              dialogError = 'Erreur réseau : $e';
+                            });
+                          } finally {
+                            setDialogState(() {
+                              isGenerating = false;
+                            });
+                          }
+                        },
+                  style: ElevatedButton.styleFrom(backgroundColor: Colors.teal),
+                  child: isGenerating
+                      ? const SizedBox(
+                          width: 20,
+                          height: 20,
+                          child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2),
+                        )
+                      : const Text('Générer'),
+                ),
+              ],
+            );
+          },
+        );
+      },
+    );
   }
 
   @override
@@ -252,10 +490,35 @@ class _SimulationTabState extends State<SimulationTab> {
                     ),
                     const SizedBox(height: 16),
                     const Divider(),
-                    const SizedBox(height: 16),
+                    const SizedBox(height: 8),
+                    // Paramètres Mondiaux (Terrain / Eau)
+                    const Text(
+                      'Configuration du Monde',
+                      style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold),
+                    ),
+                    SwitchListTile(
+                      title: const Text('Présence d\'eau (Mode Île)', style: TextStyle(fontSize: 13)),
+                      subtitle: const Text('L\'eau est active et les cellules s\'y noient', style: TextStyle(fontSize: 11)),
+                      value: _noyadeActive,
+                      onChanged: _selectedSimId == null ? null : (val) => _toggleNoyade(val),
+                      contentPadding: EdgeInsets.zero,
+                      activeThumbColor: Colors.tealAccent,
+                    ),
+                    const SizedBox(height: 8),
+                    ElevatedButton.icon(
+                      onPressed: (_selectedSimId == null || !_noyadeActive) ? null : _showGenerateMapDialog,
+                      icon: const Icon(Icons.map, size: 16),
+                      label: const Text('Générer Île / Carte', style: TextStyle(fontSize: 12)),
+                      style: ElevatedButton.styleFrom(
+                        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                      ),
+                    ),
+                    const Divider(),
+                    const SizedBox(height: 8),
+                    // Contrôles de simulation
                     const Text(
                       'Contrôles Temporels',
-                      style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+                      style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold),
                     ),
                     const SizedBox(height: 8),
                     Row(
@@ -276,91 +539,166 @@ class _SimulationTabState extends State<SimulationTab> {
                       ],
                     ),
                     const SizedBox(height: 8),
-                    Text(
-                      _gameState != null ? 'Ticks écoulés : ${_gameState!['tick']}' : 'Ticks : -',
-                      textAlign: TextAlign.center,
-                      style: const TextStyle(color: Colors.grey, fontStyle: FontStyle.italic),
+                    Align(
+                      alignment: Alignment.centerLeft,
+                      child: Text(
+                        _gameState != null ? 'Ticks : ${_gameState!['tick']}' : 'Ticks : -',
+                        style: const TextStyle(color: Colors.grey, fontStyle: FontStyle.italic, fontSize: 13),
+                      ),
                     ),
-                    const SizedBox(height: 16),
                     const Divider(),
-                    const SizedBox(height: 16),
+                    const SizedBox(height: 8),
+                    // Outils pinceaux / Placement
                     const Text(
-                      'Placement des Entités',
-                      style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+                      'Outils d\'édition & Placement',
+                      style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold),
                     ),
-                    const SizedBox(height: 12),
+                    const SizedBox(height: 8),
                     InputDecorator(
                       decoration: const InputDecoration(
-                        labelText: 'Entité à Placer',
+                        labelText: 'Outil Actif',
                         border: OutlineInputBorder(),
                         contentPadding: EdgeInsets.symmetric(horizontal: 12, vertical: 8),
                       ),
                       child: DropdownButtonHideUnderline(
                         child: DropdownButton<String>(
-                          value: _selectedComponentId,
+                          value: _activeTool,
                           isExpanded: true,
                           isDense: true,
-                          items: _components.map<DropdownMenuItem<String>>((dynamic c) {
-                            return DropdownMenuItem<String>(
-                              value: c['id'],
+                          items: [
+                            const DropdownMenuItem(value: 'pan', child: Row(children: [Icon(Icons.open_with, size: 18), SizedBox(width: 8), Text('Naviguer / Déplacer')])),
+                            const DropdownMenuItem(value: 'place', child: Row(children: [Icon(Icons.add_location, size: 18), SizedBox(width: 8), Text('Placer entité')])),
+                            const DropdownMenuItem(value: 'remove', child: Row(children: [Icon(Icons.delete_sweep, size: 18), SizedBox(width: 8), Text('Retirer entité')])),
+                            DropdownMenuItem(
+                              value: 'paint_land',
+                              enabled: _noyadeActive,
                               child: Row(
                                 children: [
-                                  c['is_builtin'] == true
-                                      ? const Icon(Icons.apps, size: 20, color: Colors.teal)
-                                      : Image.network(
-                                          '${ApiClient.baseUrl}${c['icon_url']}',
-                                          width: 20,
-                                          height: 20,
-                                          errorBuilder: (context, error, stackTrace) =>
-                                              const Icon(Icons.image, size: 20),
-                                        ),
+                                  Icon(Icons.brush, size: 18, color: _noyadeActive ? Colors.green : Colors.grey),
                                   const SizedBox(width: 8),
-                                  Text(c['name']),
+                                  Text(
+                                    'Peindre Terre',
+                                    style: TextStyle(color: _noyadeActive ? null : Colors.grey),
+                                  ),
                                 ],
                               ),
-                            );
-                          }).toList(),
-                          onChanged: (String? val) {
+                            ),
+                            DropdownMenuItem(
+                              value: 'paint_water',
+                              enabled: _noyadeActive,
+                              child: Row(
+                                children: [
+                                  Icon(Icons.water, size: 18, color: _noyadeActive ? Colors.blue : Colors.grey),
+                                  const SizedBox(width: 8),
+                                  Text(
+                                    'Peindre Eau',
+                                    style: TextStyle(color: _noyadeActive ? null : Colors.grey),
+                                  ),
+                                ],
+                              ),
+                            ),
+                          ],
+                          onChanged: (val) {
                             if (val != null) {
                               setState(() {
-                                _selectedComponentId = val;
+                                _activeTool = val;
                               });
                             }
                           },
                         ),
                       ),
                     ),
-                    const SizedBox(height: 16),
-                    // Mode : Placer ou Retirer
-                    Row(
-                      children: [
-                        Expanded(
-                          child: ChoiceChip(
-                            label: const Center(child: Text('Placer')),
-                            selected: _isPlacementMode,
-                            onSelected: (selected) {
-                              setState(() {
-                                _isPlacementMode = true;
-                              });
+                    if (_activeTool == 'paint_land' || _activeTool == 'paint_water') ...[
+                      const SizedBox(height: 12),
+                      Card(
+                        color: Colors.black26,
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(8),
+                          side: BorderSide(color: Colors.grey.shade800),
+                        ),
+                        child: Padding(
+                          padding: const EdgeInsets.symmetric(horizontal: 12.0, vertical: 8.0),
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.stretch,
+                            children: [
+                              Row(
+                                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                                children: [
+                                  const Text(
+                                    'Taille du pinceau',
+                                    style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold),
+                                  ),
+                                  Text(
+                                    '${_brushSize}x$_brushSize',
+                                    style: const TextStyle(fontSize: 12, color: Colors.tealAccent, fontWeight: FontWeight.bold),
+                                  ),
+                                ],
+                              ),
+                              Slider(
+                                value: _brushSize.toDouble(),
+                                min: 1.0,
+                                max: 5.0,
+                                divisions: 4,
+                                activeColor: Colors.tealAccent,
+                                inactiveColor: Colors.grey.shade800,
+                                label: '${_brushSize}x$_brushSize',
+                                onChanged: (val) {
+                                  setState(() {
+                                    _brushSize = val.round();
+                                  });
+                                },
+                              ),
+                            ],
+                          ),
+                        ),
+                      ),
+                    ],
+                    if (_activeTool == 'place') ...[
+                      const SizedBox(height: 12),
+                      InputDecorator(
+                        decoration: const InputDecoration(
+                          labelText: 'Entité à Placer',
+                          border: OutlineInputBorder(),
+                          contentPadding: EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                        ),
+                        child: DropdownButtonHideUnderline(
+                          child: DropdownButton<String>(
+                            value: _selectedComponentId,
+                            isExpanded: true,
+                            isDense: true,
+                            items: _components.map<DropdownMenuItem<String>>((dynamic c) {
+                              return DropdownMenuItem<String>(
+                                value: c['id'],
+                                child: Row(
+                                  children: [
+                                    c['is_builtin'] == true
+                                        ? const Icon(Icons.apps, size: 20, color: Colors.teal)
+                                        : Image.network(
+                                            '${ApiClient.baseUrl}${c['icon_url']}',
+                                            width: 20,
+                                            height: 20,
+                                            errorBuilder: (context, error, stackTrace) =>
+                                                const Icon(Icons.image, size: 20),
+                                          ),
+                                    const SizedBox(width: 8),
+                                    Text(c['name']),
+                                  ],
+                                ),
+                              );
+                            }).toList(),
+                            onChanged: (String? val) {
+                              if (val != null) {
+                                setState(() {
+                                  _selectedComponentId = val;
+                                });
+                              }
                             },
                           ),
                         ),
-                        const SizedBox(width: 8),
-                        Expanded(
-                          child: ChoiceChip(
-                            label: const Center(child: Text('Retirer')),
-                            selected: !_isPlacementMode,
-                            onSelected: (selected) {
-                              setState(() {
-                                _isPlacementMode = false;
-                              });
-                            },
-                          ),
-                        ),
-                      ],
-                    ),
-                    const SizedBox(height: 16),
-                    if (_components.isNotEmpty) ...[
+                      ),
+                    ],
+                    const SizedBox(height: 12),
+                    if (_activeTool == 'place' && _components.isNotEmpty) ...[
                       Builder(
                         builder: (context) {
                           final selectedComp = _components.firstWhere(
@@ -369,43 +707,43 @@ class _SimulationTabState extends State<SimulationTab> {
                           );
                           if (selectedComp == null) return const SizedBox.shrink();
                           return Card(
-                            color: const Color(0x33004D40), // Vert foncé translucide
+                            color: const Color(0x33004D40),
                             shape: RoundedRectangleBorder(
                               borderRadius: BorderRadius.circular(12),
                               side: BorderSide(color: Colors.teal.shade800),
                             ),
                             child: Padding(
-                              padding: const EdgeInsets.all(12.0),
+                              padding: const EdgeInsets.all(10.0),
                               child: Row(
                                 children: [
                                   selectedComp['is_builtin'] == true
-                                      ? const Icon(Icons.apps, size: 40, color: Colors.tealAccent)
+                                      ? const Icon(Icons.apps, size: 36, color: Colors.tealAccent)
                                       : Image.network(
                                           '${ApiClient.baseUrl}${selectedComp['icon_url']}',
-                                          width: 40,
-                                          height: 40,
+                                          width: 36,
+                                          height: 36,
                                           errorBuilder: (context, error, stackTrace) =>
-                                              const Icon(Icons.image, size: 40),
+                                              const Icon(Icons.image, size: 36),
                                         ),
-                                  const SizedBox(width: 12),
+                                  const SizedBox(width: 10),
                                   Expanded(
                                     child: Column(
                                       crossAxisAlignment: CrossAxisAlignment.start,
                                       children: [
                                         Text(
                                           selectedComp['name'] ?? '',
-                                          style: const TextStyle(fontWeight: FontWeight.bold),
+                                          style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13),
                                         ),
                                         Text(
                                           selectedComp['description'] ?? '',
                                           maxLines: 2,
                                           overflow: TextOverflow.ellipsis,
-                                          style: const TextStyle(fontSize: 11, color: Colors.grey),
+                                          style: const TextStyle(fontSize: 10, color: Colors.grey),
                                         ),
-                                        const SizedBox(height: 4),
+                                        const SizedBox(height: 2),
                                         Text(
                                           'Vitesse ATB : ${selectedComp['atb_vitesse'] ?? 10}',
-                                          style: const TextStyle(fontSize: 10, color: Colors.tealAccent),
+                                          style: const TextStyle(fontSize: 9, color: Colors.tealAccent),
                                         ),
                                       ],
                                     ),
@@ -419,8 +757,8 @@ class _SimulationTabState extends State<SimulationTab> {
                     ],
                     const Spacer(),
                     const Text(
-                      'Astuce : Cliquez directement sur la grille pour placer ou retirer des entités.',
-                      style: TextStyle(color: Colors.grey, fontSize: 12),
+                      'Astuce : Utilisez la molette ou pincez pour zoomer. Glissez pour vous déplacer dans le monde.',
+                      style: TextStyle(color: Colors.grey, fontSize: 11),
                       textAlign: TextAlign.center,
                     ),
                   ],
@@ -434,19 +772,40 @@ class _SimulationTabState extends State<SimulationTab> {
             child: Card(
               elevation: 4,
               shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
-              child: Padding(
+              clipBehavior: Clip.antiAlias,
+              child: Container(
+                decoration: const BoxDecoration(
+                  image: DecorationImage(
+                    image: AssetImage('assets/fond.png'),
+                    fit: BoxFit.cover,
+                  ),
+                ),
                 padding: const EdgeInsets.all(16.0),
                 child: _gameState == null
                     ? const Center(
                         child: Text(
                           "Sélectionnez ou créez un monde pour démarrer la simulation",
-                          style: TextStyle(color: Colors.grey),
+                          style: TextStyle(
+                            color: Colors.white,
+                            fontSize: 16,
+                            fontWeight: FontWeight.bold,
+                            shadows: [
+                              Shadow(
+                                offset: Offset(1.0, 1.0),
+                                blurRadius: 4.0,
+                                color: Colors.black,
+                              ),
+                            ],
+                          ),
+                          textAlign: TextAlign.center,
                         ),
                       )
                     : InteractiveIslandPainterWidget(
                         gameState: _gameState!,
                         onTapCell: _handleCellTap,
+                        onPaintCell: _handleCellPaint,
                         iconCache: _iconCache,
+                        activeTool: _activeTool,
                       ),
               ),
             ),
