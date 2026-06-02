@@ -36,6 +36,7 @@ dependencies:
   cupertino_icons: ^1.0.8
   http: ^1.6.0
   file_picker: ^11.0.2
+  archive: ^3.6.1
 
 dev_dependencies:
   flutter_test:
@@ -61,6 +62,12 @@ flutter:
 
   assets:
     - assets/fond.png
+    - assets/bubble.png
+
+  fonts:
+    - family: Minecraft
+      fonts:
+        - asset: assets/Minecraft.ttf
 
   # An image asset can refer to one or more resolution-specific "variants", see
   # https://flutter.dev/to/resolution-aware-images

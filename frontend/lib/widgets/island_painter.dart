@@ -7,6 +7,7 @@ class InteractiveIslandPainterWidget extends StatefulWidget {
   final Function(int x, int y)? onPaintCell;
   final Map<String, ui.Image> iconCache;
   final String activeTool;
+  final ui.Image? bubbleImage;
 
   const InteractiveIslandPainterWidget({
     super.key,
@@ -15,6 +16,7 @@ class InteractiveIslandPainterWidget extends StatefulWidget {
     this.onPaintCell,
     required this.iconCache,
     required this.activeTool,
+    this.bubbleImage,
   });
 
   @override
@@ -95,6 +97,7 @@ class _InteractiveIslandPainterWidgetState extends State<InteractiveIslandPainte
                 gameState: widget.gameState,
                 iconCache: widget.iconCache,
                 cellSize: cellSize,
+                bubbleImage: widget.bubbleImage,
               ),
             ),
           ),
@@ -108,11 +111,13 @@ class IslandPainter extends CustomPainter {
   final Map<String, dynamic> gameState;
   final Map<String, ui.Image> iconCache;
   final double cellSize;
+  final ui.Image? bubbleImage;
 
   IslandPainter({
     required this.gameState,
     required this.iconCache,
     required this.cellSize,
+    this.bubbleImage,
   });
 
   Color _parseHexColor(String hex) {
@@ -235,6 +240,32 @@ class IslandPainter extends CustomPainter {
       canvas.drawLine(Offset(0, j * cellSize), Offset(width * cellSize, j * cellSize), gridLinePaint);
     }
 
+    // Dessin des zones d'intimité (Lueur d'arrière-plan verte/rouge)
+    final List<dynamic> aliveComps = composants.where((c) => c['vivant'] == true).toList();
+    final List<List<dynamic>> clusters = _findClusters(aliveComps);
+    for (var cluster in clusters) {
+      if (_isIntimacyZone(cluster, aliveComps)) {
+        final bool isNegative = _isNegativeGroup(cluster);
+        final Color glowColor = isNegative ? Colors.redAccent : Colors.greenAccent;
+        
+        final Paint glowPaint = Paint()
+          ..color = glowColor.withValues(alpha: 0.18)
+          ..maskFilter = const MaskFilter.blur(BlurStyle.normal, 15.0)
+          ..style = PaintingStyle.fill;
+
+        final Path glowPath = Path();
+        for (var member in cluster) {
+          final double cx = (member['x'] ?? 0) * cellSize + cellSize / 2;
+          final double cy = (member['y'] ?? 0) * cellSize + cellSize / 2;
+          glowPath.addOval(Rect.fromCircle(center: Offset(cx, cy), radius: 3.5 * cellSize));
+        }
+
+        canvas.save();
+        canvas.drawPath(glowPath, glowPaint);
+        canvas.restore();
+      }
+    }
+
     // Dessin des composants vivants
     for (var comp in composants) {
       if (comp['vivant']) {
@@ -254,6 +285,206 @@ class IslandPainter extends CustomPainter {
         _drawShape(canvas, rect, shape, coin, orientation, componentPaint, cellSize);
       }
     }
+
+    // Dessin des bulles de dialogue si l'image des bulles est chargée
+    if (bubbleImage != null && gameState['dialogues'] != null) {
+      final List<dynamic> dialogues = gameState['dialogues'];
+      final int currentTick = gameState['tick'] ?? 0;
+
+      for (var dialogue in dialogues) {
+        final int dialogueTick = dialogue['tick'] ?? 0;
+        final int ageTicks = currentTick - dialogueTick;
+
+        // Afficher si la bulle est dans sa fenêtre de durée (75 ticks)
+        if (ageTicks >= 0 && ageTicks < 75) {
+          final int x = dialogue['x'] ?? 0;
+          final int y = dialogue['y'] ?? 0;
+          final String phrase = dialogue['phrase'] ?? '';
+          
+          if (phrase.isEmpty) continue;
+
+          // Calculer l'opacité (1.0 pendant 50 ticks, puis fondu linéaire sur les 25 suivants)
+          double opacity = 1.0;
+          if (ageTicks > 50) {
+            opacity = 1.0 - (ageTicks - 50) / 25.0;
+            if (opacity < 0.0) opacity = 0.0;
+            if (opacity > 1.0) opacity = 1.0;
+          }
+
+          // Coordonnées du locuteur sur le canevas
+          final double centerX = x * cellSize + cellSize / 2;
+          final double targetY = y * cellSize; // Haut de la case
+
+          // Peindre le texte avec la police Minecraft et l'opacité calculée
+          final TextPainter textPainter = TextPainter(
+            text: TextSpan(
+              text: phrase,
+              style: TextStyle(
+                fontFamily: 'Minecraft',
+                fontSize: 9.0,
+                color: Colors.black.withValues(alpha: opacity),
+                fontWeight: FontWeight.normal,
+              ),
+            ),
+            textDirection: TextDirection.ltr,
+          )..layout(maxWidth: 120.0);
+
+          const double tailH = 16.0;
+          const double cornerW = 32.0;
+          const double cornerH = 24.0;
+
+          // Dimensions de la bulle adaptées au texte
+          final double dstW = (textPainter.width + 24.0).clamp(2 * cornerW, 200.0);
+          final double dstH = (textPainter.height + 16.0).clamp(2 * cornerH, 150.0);
+
+          // Positionner la bulle en haut à gauche du composant (le coin bas-droite de la bulle s'aligne sur le haut-milieu de l'entité)
+          final double dstX = centerX - dstW;
+          final double dstY = targetY - dstH;
+
+          final Paint bubblePaint = Paint()
+            ..color = Colors.white.withValues(alpha: opacity)
+            ..filterQuality = FilterQuality.medium;
+
+          const double o = 1.5; // overlap offset to prevent sub-pixel seams
+
+          // Découper et dessiner en 9-split (Style 1 de la bulle)
+          final Rect srcTL = const Rect.fromLTWH(251, 91, 246, 134);
+          final Rect srcTM = const Rect.fromLTWH(564, 97, 243, 128);
+          final Rect srcTR = const Rect.fromLTWH(873, 92, 241, 133);
+          final Rect srcML = const Rect.fromLTWH(255, 265, 242, 167);
+          final Rect srcMM = const Rect.fromLTWH(564, 265, 243, 167);
+          final Rect srcMR = const Rect.fromLTWH(873, 265, 241, 167);
+          final Rect srcBL = const Rect.fromLTWH(260, 470, 237, 134);
+          final Rect srcBM = const Rect.fromLTWH(564, 470, 243, 131);
+          final Rect srcBR = const Rect.fromLTWH(873, 470, 252, 266); // Inclut la pointe/queue de la bulle
+
+          // TL
+          canvas.drawImageRect(bubbleImage!, srcTL, Rect.fromLTWH(dstX, dstY, cornerW + o, cornerH + o), bubblePaint);
+          // TR
+          canvas.drawImageRect(bubbleImage!, srcTR, Rect.fromLTWH(dstX + dstW - cornerW - o, dstY, cornerW + o, cornerH + o), bubblePaint);
+          // BL
+          canvas.drawImageRect(bubbleImage!, srcBL, Rect.fromLTWH(dstX, dstY + dstH - cornerH - o, cornerW + o, cornerH + o), bubblePaint);
+          // BR (dessiné plus grand verticalement pour y inclure la pointe)
+          canvas.drawImageRect(bubbleImage!, srcBR, Rect.fromLTWH(dstX + dstW - cornerW - o, dstY + dstH - cornerH - o, cornerW + o, cornerH + tailH + o), bubblePaint);
+          // TM
+          canvas.drawImageRect(bubbleImage!, srcTM, Rect.fromLTWH(dstX + cornerW - o, dstY, dstW - 2 * cornerW + 2 * o, cornerH + o), bubblePaint);
+          // BM
+          canvas.drawImageRect(bubbleImage!, srcBM, Rect.fromLTWH(dstX + cornerW - o, dstY + dstH - cornerH - o, dstW - 2 * cornerW + 2 * o, cornerH + o), bubblePaint);
+          // ML
+          canvas.drawImageRect(bubbleImage!, srcML, Rect.fromLTWH(dstX, dstY + cornerH - o, cornerW + o, dstH - 2 * cornerH + 2 * o), bubblePaint);
+          // MR
+          canvas.drawImageRect(bubbleImage!, srcMR, Rect.fromLTWH(dstX + dstW - cornerW - o, dstY + cornerH - o, cornerW + o, dstH - 2 * cornerH + 2 * o), bubblePaint);
+          // MM
+          canvas.drawImageRect(bubbleImage!, srcMM, Rect.fromLTWH(dstX + cornerW - o, dstY + cornerH - o, dstW - 2 * cornerW + 2 * o, dstH - 2 * cornerH + 2 * o), bubblePaint);
+
+          // Dessiner le texte centré dans la bulle
+          final double textX = dstX + (dstW - textPainter.width) / 2;
+          final double textY = dstY + (dstH - textPainter.height) / 2;
+          textPainter.paint(canvas, Offset(textX, textY));
+        }
+      }
+    }
+  }
+
+  List<List<dynamic>> _findClusters(List<dynamic> components) {
+    final List<List<dynamic>> clusters = [];
+    final Set<String> visited = {};
+
+    for (var comp in components) {
+      final String id = comp['id'];
+      if (visited.contains(id)) continue;
+
+      // Commencer un nouveau cluster
+      final List<dynamic> cluster = [];
+      final List<dynamic> queue = [comp];
+      visited.add(id);
+
+      while (queue.isNotEmpty) {
+        final current = queue.removeLast();
+        cluster.add(current);
+
+        final int cx = (current['x'] ?? 0) as int;
+        final int cy = (current['y'] ?? 0) as int;
+
+        for (var other in components) {
+          final String otherId = other['id'];
+          if (visited.contains(otherId)) continue;
+
+          final int ox = (other['x'] ?? 0) as int;
+          final int oy = (other['y'] ?? 0) as int;
+
+          // Adjacence de Chebyshev (distance <= 1)
+          if ((ox - cx).abs() <= 1 && (oy - cy).abs() <= 1) {
+            visited.add(otherId);
+            queue.add(other);
+          }
+        }
+      }
+
+      if (cluster.length >= 2) {
+        clusters.add(cluster);
+      }
+    }
+    return clusters;
+  }
+
+  bool _isIntimacyZone(List<dynamic> cluster, List<dynamic> allAliveComponents) {
+    final Set<String> clusterIds = cluster.map((c) => c['id'] as String).toSet();
+
+    for (var member in cluster) {
+      final int mx = (member['x'] ?? 0) as int;
+      final int my = (member['y'] ?? 0) as int;
+
+      for (var other in allAliveComponents) {
+        final String otherId = other['id'] as String;
+        if (clusterIds.contains(otherId)) continue;
+
+        final int ox = (other['x'] ?? 0) as int;
+        final int oy = (other['y'] ?? 0) as int;
+
+        // Rayon de 3 cases (distance de Chebyshev <= 3)
+        if ((ox - mx).abs() <= 3 && (oy - my).abs() <= 3) {
+          return false; // Intrus détecté
+        }
+      }
+    }
+    return true;
+  }
+
+  bool _isNegativeGroup(List<dynamic> cluster) {
+    // 1. Vérifier si un membre X est détesté par TOUS les autres membres Y (relation Y -> X < 50)
+    for (var X in cluster) {
+      final String xId = X['id'];
+      bool hatedByAll = true;
+      for (var Y in cluster) {
+        if (Y['id'] == xId) continue;
+        final Map<String, dynamic> relations = Y['relations'] ?? {};
+        final int score = relations[xId] ?? 50;
+        if (score >= 50) {
+          hatedByAll = false;
+          break;
+        }
+      }
+      if (hatedByAll) return true;
+    }
+
+    // 2. Vérifier si la moyenne des relations est négative (< 50)
+    double totalScore = 0;
+    int count = 0;
+    for (var A in cluster) {
+      final Map<String, dynamic> relations = A['relations'] ?? {};
+      for (var B in cluster) {
+        if (A['id'] == B['id']) continue;
+        final int score = relations[B['id']] ?? 50;
+        totalScore += score;
+        count++;
+      }
+    }
+    if (count > 0 && (totalScore / count) < 50) {
+      return true;
+    }
+
+    return false;
   }
 
   @override

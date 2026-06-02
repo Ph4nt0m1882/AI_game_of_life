@@ -87,8 +87,13 @@ class ApiClient {
     required String coin,
     required String orientation,
     required String couleur,
-    required Uint8List iconBytes,
-    required String iconFilename,
+    Uint8List? iconBytes,
+    String? iconFilename,
+    Uint8List? iconMBytes,
+    String? iconMFilename,
+    Uint8List? iconFBytes,
+    String? iconFFilename,
+    String? compId,
   }) async {
     final uri = Uri.parse('$baseUrl/api/components/build');
     final request = http.MultipartRequest('POST', uri);
@@ -102,14 +107,39 @@ class ApiClient {
     request.fields['coin'] = coin;
     request.fields['orientation'] = orientation;
     request.fields['couleur'] = couleur;
+    if (compId != null) {
+      request.fields['comp_id'] = compId;
+    }
 
-    request.files.add(
-      http.MultipartFile.fromBytes(
-        'icon',
-        iconBytes,
-        filename: iconFilename,
-      ),
-    );
+    if (iconBytes != null) {
+      request.files.add(
+        http.MultipartFile.fromBytes(
+          'icon',
+          iconBytes,
+          filename: iconFilename ?? 'icon.png',
+        ),
+      );
+    }
+
+    if (iconMBytes != null) {
+      request.files.add(
+        http.MultipartFile.fromBytes(
+          'icon_m',
+          iconMBytes,
+          filename: iconMFilename ?? 'icon_M.png',
+        ),
+      );
+    }
+
+    if (iconFBytes != null) {
+      request.files.add(
+        http.MultipartFile.fromBytes(
+          'icon_f',
+          iconFBytes,
+          filename: iconFFilename ?? 'icon_F.png',
+        ),
+      );
+    }
 
     final streamedResponse = await request.send();
     return http.Response.fromStream(streamedResponse);
@@ -182,11 +212,15 @@ class ApiClient {
   }
 
   /// Met à jour les règles de simulation (ex: noyade active)
-  static Future<bool> updateSimulationSettings(String simId, {required bool noyadeActive}) async {
+  static Future<bool> updateSimulationSettings(String simId, {required bool noyadeActive, required double speedFactor, String? geminiApiKey}) async {
     final response = await http.put(
       Uri.parse('$baseUrl/api/simulations/$simId/settings'),
       headers: {"Content-Type": "application/json"},
-      body: json.encode({"noyade_active": noyadeActive}),
+      body: json.encode({
+        "noyade_active": noyadeActive,
+        "speed_factor": speedFactor,
+        "gemini_api_key": geminiApiKey ?? "",
+      }),
     );
     return response.statusCode == 200;
   }

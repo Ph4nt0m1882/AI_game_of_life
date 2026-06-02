@@ -13,6 +13,24 @@ class Composant:
         self.type_nom = "Composant"
         self.couleur = "#000000"  # Noir par défaut, format hexadécimal
         self.forme = "carré"  # carré, carré_arrondi, cercle, triangle, triangle_inverse
+        self.coin = "droit"
+        self.orientation = "standard"
+        
+        # Charger les métadonnées depuis le registre
+        if self.type_id:
+            try:
+                from core.loader import METADATA_REGISTRY
+                meta = next((m for m in METADATA_REGISTRY if m["id"] == self.type_id), None)
+                if meta:
+                    self.type_nom = meta.get("name", self.type_nom)
+                    self.forme = meta.get("forme", self.forme)
+                    self.couleur = meta.get("couleur", self.couleur)
+                    self.coin = meta.get("coin", self.coin)
+                    self.orientation = meta.get("orientation", self.orientation)
+                    if atb_vitesse == 10:
+                        self.atb_vitesse = meta.get("atb_vitesse", atb_vitesse)
+            except Exception:
+                pass
 
     def update_atb(self):
         """Ajoute de la vitesse à l'ATB. Retourne True si l'action doit être déclenchée."""
@@ -44,6 +62,14 @@ class Composant:
                 stats_data = self.stats()
             except Exception as e:
                 stats_data = {"Erreur": str(e)}
+                
+        # Détection dynamique d'une variante d'icône (ex: sexe)
+        icon_variant = None
+        if hasattr(self, "sexe"):
+            icon_variant = str(self.sexe)
+        elif hasattr(self, "variant"):
+            icon_variant = str(self.variant)
+            
         return {
             "id": self.id,
             "type_id": self.type_id,
@@ -53,6 +79,8 @@ class Composant:
             "vivant": self.vivant,
             "couleur": self.couleur,
             "forme": self.forme,
-            "stats": stats_data
+            "stats": stats_data,
+            "icon_variant": icon_variant,
+            "relations": getattr(self, "relations", {})
         }
 

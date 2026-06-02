@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:file_picker/file_picker.dart';
-import '../services/api_client.dart';
+import 'package:flutter/foundation.dart' show kIsWeb;
+import '../services/client_settings.dart';
 
 class SettingsTab extends StatefulWidget {
   const SettingsTab({super.key});
@@ -11,6 +12,7 @@ class SettingsTab extends StatefulWidget {
 
 class _SettingsTabState extends State<SettingsTab> {
   final _dirController = TextEditingController();
+  final _apiKeyController = TextEditingController();
   bool _isLoading = false;
   String _statusMessage = '';
 
@@ -26,10 +28,15 @@ class _SettingsTabState extends State<SettingsTab> {
       _statusMessage = '';
     });
     try {
-      final dataDir = await ApiClient.getSettings();
-      setState(() {
+      if (kIsWeb) {
+        _dirController.text = 'Mode Web (fichiers téléchargés par le navigateur)';
+      } else {
+        final dataDir = await ClientSettings.getWorkspacePath();
         _dirController.text = dataDir;
-      });
+      }
+      
+      final apiKey = await ClientSettings.getGeminiApiKey();
+      _apiKeyController.text = apiKey;
     } catch (e) {
       setState(() {
         _statusMessage = 'Erreur lors du chargement : $e';
@@ -42,6 +49,7 @@ class _SettingsTabState extends State<SettingsTab> {
   }
 
   Future<void> _browseDirectory() async {
+    if (kIsWeb) return;
     try {
       final String? selectedPath = await FilePicker.getDirectoryPath();
       if (selectedPath != null) {
@@ -60,7 +68,7 @@ class _SettingsTabState extends State<SettingsTab> {
 
   Future<void> _saveSettings() async {
     final path = _dirController.text.trim();
-    if (path.isEmpty) return;
+    final apiKey = _apiKeyController.text.trim();
 
     setState(() {
       _isLoading = true;
@@ -68,13 +76,13 @@ class _SettingsTabState extends State<SettingsTab> {
     });
 
     try {
-      final updatedPath = await ApiClient.updateSettings(path);
-      setState(() {
-        _dirController.text = updatedPath;
-      });
+      if (!kIsWeb && path.isNotEmpty) {
+        await ClientSettings.setWorkspacePath(path);
+      }
+      await ClientSettings.setGeminiApiKey(apiKey);
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Dossier de travail mis à jour avec succès !'), backgroundColor: Colors.green),
+          const SnackBar(content: Text('Paramètres mis à jour avec succès !'), backgroundColor: Colors.green),
         );
       }
     } catch (e) {
@@ -132,6 +140,7 @@ class _SettingsTabState extends State<SettingsTab> {
                       Expanded(
                         child: TextField(
                           controller: _dirController,
+                          enabled: !kIsWeb,
                           decoration: const InputDecoration(
                             labelText: 'Chemin du dossier de travail',
                             border: OutlineInputBorder(),
@@ -139,16 +148,63 @@ class _SettingsTabState extends State<SettingsTab> {
                           ),
                         ),
                       ),
-                      const SizedBox(width: 12),
-                      ElevatedButton.icon(
-                        onPressed: _isLoading ? null : _browseDirectory,
-                        icon: const Icon(Icons.folder_open),
-                        label: const Text('Parcourir'),
-                        style: ElevatedButton.styleFrom(
-                          padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 16),
+                      if (!kIsWeb) ...[
+                        const SizedBox(width: 12),
+                        ElevatedButton.icon(
+                          onPressed: _isLoading ? null : _browseDirectory,
+                          icon: const Icon(Icons.folder_open),
+                          label: const Text('Parcourir'),
+                          style: ElevatedButton.styleFrom(
+                            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 16),
+                          ),
                         ),
-                      ),
+                      ],
                     ],
+                  ),
+                  if (kIsWeb) ...[
+                    const SizedBox(height: 16),
+                    Container(
+                      padding: const EdgeInsets.all(12),
+                      decoration: BoxDecoration(
+                        color: Colors.blue.withValues(alpha: 0.15),
+                        borderRadius: BorderRadius.circular(8),
+                        border: Border.all(color: Colors.blue.shade800),
+                      ),
+                      child: const Row(
+                        children: [
+                          Icon(Icons.info_outline, color: Colors.blueAccent),
+                          SizedBox(width: 12),
+                          Expanded(
+                            child: Text(
+                              'En mode Web, la configuration du répertoire de travail local n\'est pas prise en charge pour des raisons de sécurité. Les composants générés seront directement téléchargés par votre navigateur.',
+                              style: TextStyle(fontSize: 12, color: Colors.grey),
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                  ],
+                  const SizedBox(height: 24),
+                  const Divider(),
+                  const SizedBox(height: 16),
+                  const Text(
+                    'Configuration d\'Intelligence Artificielle',
+                    style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+                  ),
+                  const SizedBox(height: 8),
+                  Text(
+                    'Renseignez votre clé API Gemini (Google AI Studio) pour activer la génération automatique et l\'analyse de sentiment des dialogues entre habitants.',
+                    style: TextStyle(fontSize: 12, color: Colors.grey.shade400),
+                  ),
+                  const SizedBox(height: 16),
+                  TextField(
+                    controller: _apiKeyController,
+                    obscureText: true,
+                    decoration: const InputDecoration(
+                      labelText: 'Clé API Gemini (Google AI Studio)',
+                      border: OutlineInputBorder(),
+                      contentPadding: EdgeInsets.symmetric(horizontal: 12, vertical: 12),
+                    ),
                   ),
                   if (_statusMessage.isNotEmpty) ...[
                     const SizedBox(height: 12),

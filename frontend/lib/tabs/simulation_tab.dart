@@ -1,9 +1,15 @@
 import 'dart:async';
 import 'dart:convert';
+import 'dart:io' as io;
 import 'dart:ui' as ui;
 import 'package:flutter/material.dart';
+import 'package:flutter/foundation.dart' show kIsWeb;
+import 'package:file_picker/file_picker.dart';
 import 'package:http/http.dart' as http;
 import '../services/api_client.dart';
+import '../services/client_settings.dart';
+import '../services/local_components_manager.dart';
+import 'package:flutter/services.dart';
 import '../widgets/island_painter.dart';
 
 class SimulationTab extends StatefulWidget {
@@ -16,15 +22,18 @@ class SimulationTab extends StatefulWidget {
 class _SimulationTabState extends State<SimulationTab> {
   List<dynamic> _simulations = [];
   List<dynamic> _components = [];
+  final Set<String> _uploadedCustomComponentIds = {};
   String? _selectedSimId;
   String? _selectedComponentId;
   String _activeTool = 'place'; // 'place', 'remove', 'paint_land', 'paint_water'
   int _brushSize = 1; // Taille du pinceau (1 = 1x1, 2 = rayon 1, etc.)
   bool _noyadeActive = true;
+  double _speedFactor = 1.0;
   Timer? _pollingTimer;
   Timer? _listTimer;
   Map<String, dynamic>? _gameState;
   bool _isRunning = false;
+  String _geminiApiKey = '';
   
   // États pour le volet de statistiques
   bool _showStatsPanel = false;
@@ -33,6 +42,7 @@ class _SimulationTabState extends State<SimulationTab> {
   bool _selectedComponentAlive = true;
 
   final Map<String, ui.Image> _iconCache = {};
+  ui.Image? _bubbleImage;
 
   Future<void> _loadIconToCache(String typeName, String url) async {
     if (_iconCache.containsKey(typeName)) return;
@@ -55,6 +65,8 @@ class _SimulationTabState extends State<SimulationTab> {
   @override
   void initState() {
     super.initState();
+    _loadGeminiApiKey();
+    _loadBubbleImage();
     _fetchSimulations();
     _fetchComponents();
     
@@ -79,14 +91,63 @@ class _SimulationTabState extends State<SimulationTab> {
     super.dispose();
   }
 
+  Future<void> _loadGeminiApiKey() async {
+    try {
+      final apiKey = await ClientSettings.getGeminiApiKey();
+      if (mounted) {
+        setState(() {
+          _geminiApiKey = apiKey;
+        });
+      }
+      if (_selectedSimId != null && apiKey.isNotEmpty) {
+        await ApiClient.updateSimulationSettings(
+          _selectedSimId!,
+          noyadeActive: _noyadeActive,
+          speedFactor: _speedFactor,
+          geminiApiKey: apiKey,
+        );
+      }
+    } catch (_) {}
+  }
+
+  Future<void> _loadBubbleImage() async {
+    try {
+      final data = await rootBundle.load('assets/bubble.png');
+      final bytes = data.buffer.asUint8List();
+      final codec = await ui.instantiateImageCodec(bytes);
+      final frame = await codec.getNextFrame();
+      if (mounted) {
+        setState(() {
+          _bubbleImage = frame.image;
+        });
+      }
+    } catch (e) {
+      // Ignorer
+    }
+  }
+
   Future<void> _fetchSimulations() async {
     try {
       final fetchedSims = await ApiClient.fetchSimulations();
       setState(() {
         _simulations = fetchedSims;
+        
+        final exists = _simulations.any((s) => s['id'] == _selectedSimId);
+        if (!exists) {
+          _selectedSimId = null;
+          _uploadedCustomComponentIds.clear();
+        }
+        
         if (_selectedSimId == null && _simulations.isNotEmpty) {
           _selectedSimId = _simulations.first['id'];
           _isRunning = _simulations.first['is_running'];
+        }
+
+        if (_selectedSimId != null) {
+          final activeSim = _simulations.firstWhere((s) => s['id'] == _selectedSimId, orElse: () => null);
+          if (activeSim != null) {
+            _speedFactor = (activeSim['speed_factor'] ?? 1.0).toDouble();
+          }
         }
       });
     } catch (e) {
@@ -94,19 +155,106 @@ class _SimulationTabState extends State<SimulationTab> {
     }
   }
 
+  LocalComponent? _getLocalComponent(String id) {
+    try {
+      return LocalComponentsManager.cachedComponents.firstWhere((c) => c.id == id);
+    } catch (e) {
+      return null;
+    }
+  }
+
+  Future<void> _importLocalSssub() async {
+    final result = await FilePicker.pickFiles(
+      type: FileType.custom,
+      allowedExtensions: ['sssub'],
+      withData: true,
+    );
+    if (result != null && result.files.isNotEmpty) {
+      final file = result.files.first;
+      Uint8List? bytes = file.bytes;
+      if (bytes == null && file.path != null) {
+        try {
+          bytes = await io.File(file.path!).readAsBytes();
+        } catch (e) {
+          // Ignorer
+        }
+      }
+      if (bytes == null) return;
+
+      try {
+        final localComp = await LocalComponentsManager.loadFromSssubBytes(bytes, file.name, file.path ?? file.name);
+        if (localComp == null) {
+          throw Exception("Impossible de décoder le composant .sssub.");
+        }
+
+        if (kIsWeb) {
+          LocalComponentsManager.addWebComponent(localComp);
+        } else {
+          final workspacePath = await ClientSettings.getWorkspacePath();
+          final targetFile = io.File('$workspacePath/${localComp.id}.sssub');
+          await targetFile.writeAsBytes(bytes);
+        }
+
+        await _fetchComponents();
+        
+        setState(() {
+          _selectedComponentId = localComp.id;
+        });
+
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text('Composant "${localComp.name}" importé avec succès !'),
+              backgroundColor: Colors.green,
+            ),
+          );
+        }
+      } catch (e) {
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text('Erreur d\'importation : $e'),
+              backgroundColor: Colors.red,
+            ),
+          );
+        }
+      }
+    }
+  }
+
   Future<void> _fetchComponents() async {
     try {
-      final fetchedComps = await ApiClient.fetchComponents();
+      final localComps = await LocalComponentsManager.scanLocalComponents();
+      final List<dynamic> localMeta = localComps.map((c) => c.toMetadata()).toList();
+
+      List<dynamic> serverComps = [];
+      try {
+        serverComps = await ApiClient.fetchComponents();
+      } catch (e) {
+        // Ignorer
+      }
+
+      final Map<String, dynamic> merged = {};
+      for (var c in serverComps) {
+        if (c['is_builtin'] == true) {
+          merged[c['id']] = c;
+        }
+      }
+      for (var c in localMeta) {
+        merged[c['id']] = c;
+      }
+
+      final mergedList = merged.values.toList();
+
       setState(() {
-        _components = fetchedComps;
+        _components = mergedList;
         if (_selectedComponentId == null || !_components.any((c) => c['id'] == _selectedComponentId)) {
           _selectedComponentId = _components.isNotEmpty ? _components.first['id'] : null;
         }
       });
-
-      // Charger les images dans le cache
-      for (var c in fetchedComps) {
-        if (c['is_builtin'] == false && c['id'] != null && c['icon_url'] != null) {
+      
+      for (var c in serverComps) {
+        if (c['is_builtin'] == true && c['id'] != null && c['icon_url'] != null) {
           _loadIconToCache(c['name'], '${ApiClient.baseUrl}${c['icon_url']}');
         }
       }
@@ -161,6 +309,14 @@ class _SimulationTabState extends State<SimulationTab> {
   Future<void> _toggleSim(bool start) async {
     if (_selectedSimId == null) return;
     try {
+      if (start) {
+        await ApiClient.updateSimulationSettings(
+          _selectedSimId!,
+          noyadeActive: _noyadeActive,
+          speedFactor: _speedFactor,
+          geminiApiKey: _geminiApiKey,
+        );
+      }
       final success = start 
           ? await ApiClient.startSimulation(_selectedSimId!)
           : await ApiClient.stopSimulation(_selectedSimId!);
@@ -177,7 +333,7 @@ class _SimulationTabState extends State<SimulationTab> {
   Future<void> _toggleNoyade(bool value) async {
     if (_selectedSimId == null) return;
     try {
-      final success = await ApiClient.updateSimulationSettings(_selectedSimId!, noyadeActive: value);
+      final success = await ApiClient.updateSimulationSettings(_selectedSimId!, noyadeActive: value, speedFactor: _speedFactor, geminiApiKey: _geminiApiKey);
       if (success) {
         setState(() {
           _noyadeActive = value;
@@ -186,6 +342,20 @@ class _SimulationTabState extends State<SimulationTab> {
           }
         });
         _fetchGameState();
+      }
+    } catch (e) {
+      // Ignorer
+    }
+  }
+
+  Future<void> _updateSpeedFactor(double value) async {
+    if (_selectedSimId == null) return;
+    try {
+      final success = await ApiClient.updateSimulationSettings(_selectedSimId!, noyadeActive: _noyadeActive, speedFactor: value, geminiApiKey: _geminiApiKey);
+      if (success) {
+        setState(() {
+          _speedFactor = value;
+        });
       }
     } catch (e) {
       // Ignorer
@@ -225,6 +395,138 @@ class _SimulationTabState extends State<SimulationTab> {
     }
   }
 
+  Future<bool> _ensureComponentUploaded(LocalComponent localComp) async {
+    if (_uploadedCustomComponentIds.contains(localComp.id)) {
+      return true;
+    }
+    
+    final sssubFile = io.File(localComp.path);
+    if (!await sssubFile.exists()) {
+      if (mounted) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Le fichier .sssub local est introuvable.'), backgroundColor: Colors.red),
+        );
+      }
+      return false;
+    }
+
+    // Afficher la boîte de dialogue de chargement
+    if (mounted) {
+      showDialog(
+        context: context,
+        barrierDismissible: false,
+        builder: (BuildContext context) {
+          return PopScope(
+            canPop: false, // Empêcher l'utilisateur de fermer la boîte de dialogue avec le bouton Retour
+            child: Dialog(
+              backgroundColor: Colors.transparent,
+              elevation: 0,
+              child: Center(
+                child: Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 32),
+                  decoration: BoxDecoration(
+                    color: const Color(0xFF1E1E2E).withValues(alpha: 0.95), // Sleek dark card background
+                    borderRadius: BorderRadius.circular(20),
+                    border: Border.all(
+                      color: Colors.tealAccent.withValues(alpha: 0.3),
+                      width: 1.5,
+                    ),
+                    boxShadow: [
+                      BoxShadow(
+                        color: Colors.tealAccent.withValues(alpha: 0.15),
+                        blurRadius: 20,
+                        spreadRadius: 2,
+                      ),
+                    ],
+                  ),
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      // Loading animation stack with a nice glowing effect
+                      Stack(
+                        alignment: Alignment.center,
+                        children: [
+                          const SizedBox(
+                            width: 60,
+                            height: 60,
+                            child: CircularProgressIndicator(
+                              valueColor: AlwaysStoppedAnimation<Color>(Colors.tealAccent),
+                              strokeWidth: 4,
+                            ),
+                          ),
+                          const Icon(
+                            Icons.cloud_upload_rounded,
+                            color: Colors.tealAccent,
+                            size: 28,
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 24),
+                      const Text(
+                        'Initialisation de l\'entité',
+                        style: TextStyle(
+                          color: Colors.white,
+                          fontSize: 16,
+                          fontWeight: FontWeight.bold,
+                          letterSpacing: 0.5,
+                        ),
+                      ),
+                      const SizedBox(height: 8),
+                      Text(
+                        'Téléversement de "${localComp.name}" vers le serveur...',
+                        textAlign: TextAlign.center,
+                        style: TextStyle(
+                          color: Colors.grey,
+                          fontSize: 13,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+              ),
+            ),
+          );
+        },
+      );
+      // Donner une fraction de seconde à Flutter pour afficher le dialogue avant le travail lourd
+      await Future.delayed(const Duration(milliseconds: 100));
+    }
+
+    try {
+      final sssubBytes = await sssubFile.readAsBytes();
+      final uploadResponse = await ApiClient.uploadComponent(
+        sssubBytes,
+        sssubFile.path.split(io.Platform.pathSeparator).last,
+      );
+
+      // Fermer la boîte de dialogue de chargement
+      if (mounted) {
+        Navigator.of(context).pop();
+      }
+
+      if (uploadResponse.statusCode == 200) {
+        _uploadedCustomComponentIds.add(localComp.id);
+        return true;
+      } else {
+        final errorMsg = json.decode(uploadResponse.body)['detail'] ?? 'Erreur lors du téléversement du composant';
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text(errorMsg), backgroundColor: Colors.orange),
+          );
+        }
+        return false;
+      }
+    } catch (e) {
+      if (mounted) {
+        Navigator.of(context).pop();
+        ScaffoldMessenger.of(context).showSnackBar(
+          SnackBar(content: Text('Erreur réseau lors de l\'upload : $e'), backgroundColor: Colors.red),
+        );
+      }
+      return false;
+    }
+  }
+
   Future<void> _handleCellTap(int x, int y) async {
     if (_selectedSimId == null) return;
     
@@ -251,7 +553,28 @@ class _SimulationTabState extends State<SimulationTab> {
     } else if (_activeTool == 'place') {
       if (_selectedComponentId == null) return;
       try {
-        final response = await ApiClient.addComponent(_selectedSimId!, _selectedComponentId!, x, y);
+        final localComp = _getLocalComponent(_selectedComponentId!);
+        if (localComp != null) {
+          final ok = await _ensureComponentUploaded(localComp);
+          if (!ok) return;
+        }
+
+        var response = await ApiClient.addComponent(_selectedSimId!, _selectedComponentId!, x, y);
+        if (response.statusCode != 200) {
+          final errorMsg = json.decode(response.body)['detail'] ?? '';
+          if (errorMsg.contains('inconnu') || errorMsg.contains('impossible à charger') || errorMsg.contains("n'existe pas")) {
+            // Le serveur a perdu le composant (par ex. suite à un redémarrage). On le ré-upload à la volée.
+            _uploadedCustomComponentIds.remove(_selectedComponentId);
+            if (localComp != null) {
+              final ok = await _ensureComponentUploaded(localComp);
+              if (ok) {
+                // Deuxième tentative d'ajout après ré-upload réussi
+                response = await ApiClient.addComponent(_selectedSimId!, _selectedComponentId!, x, y);
+              }
+            }
+          }
+        }
+
         if (response.statusCode == 200) {
           _fetchGameState();
         } else {
@@ -530,272 +853,345 @@ def generer_grille(width, height):
                     ),
                     const SizedBox(height: 16),
                     const Divider(),
-                    const SizedBox(height: 8),
-                    // Paramètres Mondiaux (Terrain / Eau)
-                    const Text(
-                      'Configuration du Monde',
-                      style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold),
-                    ),
-                    SwitchListTile(
-                      title: const Text('Présence d\'eau (Mode Île)', style: TextStyle(fontSize: 13)),
-                      subtitle: const Text('L\'eau est active et les cellules s\'y noient', style: TextStyle(fontSize: 11)),
-                      value: _noyadeActive,
-                      onChanged: _selectedSimId == null ? null : (val) => _toggleNoyade(val),
-                      contentPadding: EdgeInsets.zero,
-                      activeThumbColor: Colors.tealAccent,
-                    ),
-                    const SizedBox(height: 8),
-                    ElevatedButton.icon(
-                      onPressed: (_selectedSimId == null || !_noyadeActive) ? null : _showGenerateMapDialog,
-                      icon: const Icon(Icons.map, size: 16),
-                      label: const Text('Générer Île / Carte', style: TextStyle(fontSize: 12)),
-                      style: ElevatedButton.styleFrom(
-                        padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
-                      ),
-                    ),
-                    const Divider(),
-                    const SizedBox(height: 8),
-                    // Contrôles de simulation
-                    const Text(
-                      'Contrôles Temporels',
-                      style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold),
-                    ),
-                    const SizedBox(height: 8),
-                    Row(
-                      mainAxisAlignment: MainAxisAlignment.spaceEvenly,
-                      children: [
-                        ElevatedButton.icon(
-                          onPressed: _selectedSimId == null || _isRunning ? null : () => _toggleSim(true),
-                          icon: const Icon(Icons.play_arrow),
-                          label: const Text('Play'),
-                          style: ElevatedButton.styleFrom(backgroundColor: Colors.teal.shade700),
-                        ),
-                        ElevatedButton.icon(
-                          onPressed: _selectedSimId == null || !_isRunning ? null : () => _toggleSim(false),
-                          icon: const Icon(Icons.pause),
-                          label: const Text('Pause'),
-                          style: ElevatedButton.styleFrom(backgroundColor: Colors.teal.shade900),
-                        ),
-                      ],
-                    ),
-                    const SizedBox(height: 8),
-                    Align(
-                      alignment: Alignment.centerLeft,
-                      child: Text(
-                        _gameState != null ? 'Ticks : ${_gameState!['tick']}' : 'Ticks : -',
-                        style: const TextStyle(color: Colors.grey, fontStyle: FontStyle.italic, fontSize: 13),
-                      ),
-                    ),
-                    const Divider(),
-                    const SizedBox(height: 8),
-                    // Outils pinceaux / Placement
-                    const Text(
-                      'Outils d\'édition & Placement',
-                      style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold),
-                    ),
-                    const SizedBox(height: 8),
-                    InputDecorator(
-                      decoration: const InputDecoration(
-                        labelText: 'Outil Actif',
-                        border: OutlineInputBorder(),
-                        contentPadding: EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-                      ),
-                      child: DropdownButtonHideUnderline(
-                        child: DropdownButton<String>(
-                          value: _activeTool,
-                          isExpanded: true,
-                          isDense: true,
-                          items: [
-                            const DropdownMenuItem(value: 'pan', child: Row(children: [Icon(Icons.open_with, size: 18), SizedBox(width: 8), Text('Naviguer / Déplacer')])),
-                            const DropdownMenuItem(value: 'place', child: Row(children: [Icon(Icons.add_location, size: 18), SizedBox(width: 8), Text('Placer entité')])),
-                            const DropdownMenuItem(value: 'remove', child: Row(children: [Icon(Icons.delete_sweep, size: 18), SizedBox(width: 8), Text('Retirer entité')])),
-                            DropdownMenuItem(
-                              value: 'paint_land',
-                              enabled: _noyadeActive,
-                              child: Row(
-                                children: [
-                                  Icon(Icons.brush, size: 18, color: _noyadeActive ? Colors.green : Colors.grey),
-                                  const SizedBox(width: 8),
-                                  Text(
-                                    'Peindre Terre',
-                                    style: TextStyle(color: _noyadeActive ? null : Colors.grey),
-                                  ),
-                                ],
+                    Expanded(
+                      child: SingleChildScrollView(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.stretch,
+                          children: [
+                            const SizedBox(height: 8),
+                            // Paramètres Mondiaux (Terrain / Eau)
+                            const Text(
+                              'Configuration du Monde',
+                              style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold),
+                            ),
+                            SwitchListTile(
+                              title: const Text('Présence d\'eau (Mode Île)', style: TextStyle(fontSize: 13)),
+                              subtitle: const Text('L\'eau est active et les cellules s\'y noient', style: TextStyle(fontSize: 11)),
+                              value: _noyadeActive,
+                              onChanged: _selectedSimId == null ? null : (val) => _toggleNoyade(val),
+                              contentPadding: EdgeInsets.zero,
+                              activeThumbColor: Colors.tealAccent,
+                            ),
+                            const SizedBox(height: 8),
+                            ElevatedButton.icon(
+                              onPressed: (_selectedSimId == null || !_noyadeActive) ? null : _showGenerateMapDialog,
+                              icon: const Icon(Icons.map, size: 16),
+                              label: const Text('Générer Île / Carte', style: TextStyle(fontSize: 12)),
+                              style: ElevatedButton.styleFrom(
+                                padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
                               ),
                             ),
-                            DropdownMenuItem(
-                              value: 'paint_water',
-                              enabled: _noyadeActive,
-                              child: Row(
-                                children: [
-                                  Icon(Icons.water, size: 18, color: _noyadeActive ? Colors.blue : Colors.grey),
-                                  const SizedBox(width: 8),
-                                  Text(
-                                    'Peindre Eau',
-                                    style: TextStyle(color: _noyadeActive ? null : Colors.grey),
-                                  ),
-                                ],
+                            const Divider(),
+                            const SizedBox(height: 8),
+                            // Contrôles de simulation
+                            const Text(
+                              'Contrôles Temporels',
+                              style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold),
+                            ),
+                            const SizedBox(height: 8),
+                            Row(
+                              mainAxisAlignment: MainAxisAlignment.spaceEvenly,
+                              children: [
+                                ElevatedButton.icon(
+                                  onPressed: _selectedSimId == null || _isRunning ? null : () => _toggleSim(true),
+                                  icon: const Icon(Icons.play_arrow),
+                                  label: const Text('Play'),
+                                  style: ElevatedButton.styleFrom(backgroundColor: Colors.teal.shade700),
+                                ),
+                                ElevatedButton.icon(
+                                  onPressed: _selectedSimId == null || !_isRunning ? null : () => _toggleSim(false),
+                                  icon: const Icon(Icons.pause),
+                                  label: const Text('Pause'),
+                                  style: ElevatedButton.styleFrom(backgroundColor: Colors.teal.shade900),
+                                ),
+                              ],
+                            ),
+                            const SizedBox(height: 8),
+                            Align(
+                              alignment: Alignment.centerLeft,
+                              child: Text(
+                                _gameState != null ? 'Ticks : ${_gameState!['tick']}' : 'Ticks : -',
+                                style: const TextStyle(color: Colors.grey, fontStyle: FontStyle.italic, fontSize: 13),
                               ),
                             ),
-                          ],
-                          onChanged: (val) {
-                            if (val != null) {
-                              setState(() {
-                                _activeTool = val;
-                              });
-                            }
-                          },
-                        ),
-                      ),
-                    ),
-                    if (_activeTool == 'paint_land' || _activeTool == 'paint_water') ...[
-                      const SizedBox(height: 12),
-                      Card(
-                        color: Colors.black26,
-                        shape: RoundedRectangleBorder(
-                          borderRadius: BorderRadius.circular(8),
-                          side: BorderSide(color: Colors.grey.shade800),
-                        ),
-                        child: Padding(
-                          padding: const EdgeInsets.symmetric(horizontal: 12.0, vertical: 8.0),
-                          child: Column(
-                            crossAxisAlignment: CrossAxisAlignment.stretch,
-                            children: [
-                              Row(
-                                mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                                children: [
-                                  const Text(
-                                    'Taille du pinceau',
-                                    style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold),
-                                  ),
-                                  Text(
-                                    '${_brushSize}x$_brushSize',
-                                    style: const TextStyle(fontSize: 12, color: Colors.tealAccent, fontWeight: FontWeight.bold),
-                                  ),
-                                ],
+                            const SizedBox(height: 12),
+                            const Text(
+                              'Vitesse de Simulation',
+                              style: TextStyle(fontSize: 13, fontWeight: FontWeight.w500, color: Colors.grey),
+                            ),
+                            const SizedBox(height: 6),
+                            SingleChildScrollView(
+                              scrollDirection: Axis.horizontal,
+                              child: Row(
+                                children: [0.25, 0.5, 0.75, 1.0, 2.0, 4.0, 8.0].map((factor) {
+                                  final isSelected = _speedFactor == factor;
+                                  return Padding(
+                                    padding: const EdgeInsets.symmetric(horizontal: 2.0),
+                                    child: ChoiceChip(
+                                      label: Text(
+                                        '${factor}x',
+                                        style: TextStyle(
+                                          fontSize: 11,
+                                          color: isSelected ? Colors.black : Colors.white,
+                                        ),
+                                      ),
+                                      selected: isSelected,
+                                      onSelected: _selectedSimId == null
+                                          ? null
+                                          : (bool selected) {
+                                              if (selected) {
+                                                _updateSpeedFactor(factor);
+                                              }
+                                            },
+                                      selectedColor: Colors.tealAccent,
+                                      backgroundColor: Colors.teal.shade900.withValues(alpha: 0.3),
+                                      padding: const EdgeInsets.symmetric(horizontal: 4.0),
+                                    ),
+                                  );
+                                }).toList(),
                               ),
-                              Slider(
-                                value: _brushSize.toDouble(),
-                                min: 1.0,
-                                max: 5.0,
-                                divisions: 4,
-                                activeColor: Colors.tealAccent,
-                                inactiveColor: Colors.grey.shade800,
-                                label: '${_brushSize}x$_brushSize',
-                                onChanged: (val) {
-                                  setState(() {
-                                    _brushSize = val.round();
-                                  });
-                                },
+                            ),
+                            const Divider(),
+                            const SizedBox(height: 8),
+                            // Outils pinceaux / Placement
+                            const Text(
+                              'Outils d\'édition & Placement',
+                              style: TextStyle(fontSize: 15, fontWeight: FontWeight.bold),
+                            ),
+                            const SizedBox(height: 8),
+                            InputDecorator(
+                              decoration: const InputDecoration(
+                                labelText: 'Outil Actif',
+                                border: OutlineInputBorder(),
+                                contentPadding: EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                              ),
+                              child: DropdownButtonHideUnderline(
+                                child: DropdownButton<String>(
+                                  value: _activeTool,
+                                  isExpanded: true,
+                                  isDense: true,
+                                  items: [
+                                    const DropdownMenuItem(value: 'pan', child: Row(children: [Icon(Icons.open_with, size: 18), SizedBox(width: 8), Text('Naviguer / Déplacer')])),
+                                    const DropdownMenuItem(value: 'place', child: Row(children: [Icon(Icons.add_location, size: 18), SizedBox(width: 8), Text('Placer entité')])),
+                                    const DropdownMenuItem(value: 'remove', child: Row(children: [Icon(Icons.delete_sweep, size: 18), SizedBox(width: 8), Text('Retirer entité')])),
+                                    DropdownMenuItem(
+                                      value: 'paint_land',
+                                      enabled: _noyadeActive,
+                                      child: Row(
+                                        children: [
+                                          Icon(Icons.brush, size: 18, color: _noyadeActive ? Colors.green : Colors.grey),
+                                          const SizedBox(width: 8),
+                                          Text(
+                                            'Peindre Terre',
+                                            style: TextStyle(color: _noyadeActive ? null : Colors.grey),
+                                          ),
+                                        ],
+                                      ),
+                                    ),
+                                    DropdownMenuItem(
+                                      value: 'paint_water',
+                                      enabled: _noyadeActive,
+                                      child: Row(
+                                        children: [
+                                          Icon(Icons.water, size: 18, color: _noyadeActive ? Colors.blue : Colors.grey),
+                                          const SizedBox(width: 8),
+                                          Text(
+                                            'Peindre Eau',
+                                            style: TextStyle(color: _noyadeActive ? null : Colors.grey),
+                                          ),
+                                        ],
+                                      ),
+                                    ),
+                                  ],
+                                  onChanged: (val) {
+                                    if (val != null) {
+                                      setState(() {
+                                        _activeTool = val;
+                                      });
+                                    }
+                                  },
+                                ),
+                              ),
+                            ),
+                            if (_activeTool == 'paint_land' || _activeTool == 'paint_water') ...[
+                              const SizedBox(height: 12),
+                              Card(
+                                color: Colors.black26,
+                                shape: RoundedRectangleBorder(
+                                  borderRadius: BorderRadius.circular(8),
+                                  side: BorderSide(color: Colors.grey.shade800),
+                                ),
+                                child: Padding(
+                                  padding: const EdgeInsets.symmetric(horizontal: 12.0, vertical: 8.0),
+                                  child: Column(
+                                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                                    children: [
+                                      Row(
+                                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                                        children: [
+                                          const Text(
+                                            'Taille du pinceau',
+                                            style: TextStyle(fontSize: 12, fontWeight: FontWeight.bold),
+                                          ),
+                                          Text(
+                                            '${_brushSize}x$_brushSize',
+                                            style: const TextStyle(fontSize: 12, color: Colors.tealAccent, fontWeight: FontWeight.bold),
+                                          ),
+                                        ],
+                                      ),
+                                      Slider(
+                                        value: _brushSize.toDouble(),
+                                        min: 1.0,
+                                        max: 5.0,
+                                        divisions: 4,
+                                        activeColor: Colors.tealAccent,
+                                        inactiveColor: Colors.grey.shade800,
+                                        label: '${_brushSize}x$_brushSize',
+                                        onChanged: (val) {
+                                          setState(() {
+                                            _brushSize = val.round();
+                                          });
+                                        },
+                                      ),
+                                    ],
+                                  ),
+                                ),
                               ),
                             ],
-                          ),
-                        ),
-                      ),
-                    ],
-                    if (_activeTool == 'place') ...[
-                      const SizedBox(height: 12),
-                      InputDecorator(
-                        decoration: const InputDecoration(
-                          labelText: 'Entité à Placer',
-                          border: OutlineInputBorder(),
-                          contentPadding: EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-                        ),
-                        child: DropdownButtonHideUnderline(
-                          child: DropdownButton<String>(
-                            value: _selectedComponentId,
-                            isExpanded: true,
-                            isDense: true,
-                            items: _components.map<DropdownMenuItem<String>>((dynamic c) {
-                              return DropdownMenuItem<String>(
-                                value: c['id'],
-                                child: Row(
-                                  children: [
-                                    c['is_builtin'] == true
-                                        ? const Icon(Icons.apps, size: 20, color: Colors.teal)
-                                        : Image.network(
-                                            '${ApiClient.baseUrl}${c['icon_url']}',
-                                            width: 20,
-                                            height: 20,
-                                            errorBuilder: (context, error, stackTrace) =>
-                                                const Icon(Icons.image, size: 20),
-                                          ),
-                                    const SizedBox(width: 8),
-                                    Text(c['name']),
-                                  ],
-                                ),
-                              );
-                            }).toList(),
-                            onChanged: (String? val) {
-                              if (val != null) {
-                                setState(() {
-                                  _selectedComponentId = val;
-                                });
-                              }
-                            },
-                          ),
-                        ),
-                      ),
-                    ],
-                    const SizedBox(height: 12),
-                    if (_activeTool == 'place' && _components.isNotEmpty) ...[
-                      Builder(
-                        builder: (context) {
-                          final selectedComp = _components.firstWhere(
-                            (c) => c['id'] == _selectedComponentId,
-                            orElse: () => null,
-                          );
-                          if (selectedComp == null) return const SizedBox.shrink();
-                          return Card(
-                            color: const Color(0x33004D40),
-                            shape: RoundedRectangleBorder(
-                              borderRadius: BorderRadius.circular(12),
-                              side: BorderSide(color: Colors.teal.shade800),
-                            ),
-                            child: Padding(
-                              padding: const EdgeInsets.all(10.0),
-                              child: Row(
+                            if (_activeTool == 'place') ...[
+                              const SizedBox(height: 12),
+                              Row(
                                 children: [
-                                  selectedComp['is_builtin'] == true
-                                      ? const Icon(Icons.apps, size: 36, color: Colors.tealAccent)
-                                      : Image.network(
-                                          '${ApiClient.baseUrl}${selectedComp['icon_url']}',
-                                          width: 36,
-                                          height: 36,
-                                          errorBuilder: (context, error, stackTrace) =>
-                                              const Icon(Icons.image, size: 36),
-                                        ),
-                                  const SizedBox(width: 10),
                                   Expanded(
-                                    child: Column(
-                                      crossAxisAlignment: CrossAxisAlignment.start,
-                                      children: [
-                                        Text(
-                                          selectedComp['name'] ?? '',
-                                          style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13),
+                                    child: InputDecorator(
+                                      decoration: const InputDecoration(
+                                        labelText: 'Entité à Placer',
+                                        border: OutlineInputBorder(),
+                                        contentPadding: EdgeInsets.symmetric(horizontal: 12, vertical: 8),
+                                      ),
+                                      child: DropdownButtonHideUnderline(
+                                        child: DropdownButton<String>(
+                                          value: _selectedComponentId,
+                                          isExpanded: true,
+                                          isDense: true,
+                                          items: _components.map<DropdownMenuItem<String>>((dynamic c) {
+                                            return DropdownMenuItem<String>(
+                                              value: c['id'],
+                                              child: Row(
+                                                children: [
+                                                  c['is_builtin'] == true
+                                                      ? const Icon(Icons.apps, size: 20, color: Colors.teal)
+                                                      : Builder(
+                                                          builder: (context) {
+                                                            final local = _getLocalComponent(c['id']);
+                                                            if (local != null) {
+                                                              return Image.memory(
+                                                                local.iconBytes,
+                                                                width: 20,
+                                                                height: 20,
+                                                              );
+                                                            }
+                                                            return const Icon(Icons.image, size: 20);
+                                                          },
+                                                        ),
+                                                  const SizedBox(width: 8),
+                                                  Text(c['name']),
+                                                ],
+                                              ),
+                                            );
+                                          }).toList(),
+                                          onChanged: (String? val) {
+                                            if (val != null) {
+                                              setState(() {
+                                                _selectedComponentId = val;
+                                              });
+                                            }
+                                          },
                                         ),
-                                        Text(
-                                          selectedComp['description'] ?? '',
-                                          maxLines: 2,
-                                          overflow: TextOverflow.ellipsis,
-                                          style: const TextStyle(fontSize: 10, color: Colors.grey),
-                                        ),
-                                        const SizedBox(height: 2),
-                                        Text(
-                                          'Vitesse ATB : ${selectedComp['atb_vitesse'] ?? 10}',
-                                          style: const TextStyle(fontSize: 9, color: Colors.tealAccent),
-                                        ),
-                                      ],
+                                      ),
+                                    ),
+                                  ),
+                                  const SizedBox(width: 8),
+                                  Tooltip(
+                                    message: 'Importer un fichier .sssub',
+                                    child: IconButton(
+                                      icon: const Icon(Icons.file_upload, color: Colors.tealAccent),
+                                      onPressed: _importLocalSssub,
                                     ),
                                   ),
                                 ],
                               ),
-                            ),
-                          );
-                        }
+                            ],
+                            const SizedBox(height: 12),
+                            if (_activeTool == 'place' && _components.isNotEmpty) ...[
+                              Builder(
+                                builder: (context) {
+                                  final selectedComp = _components.firstWhere(
+                                    (c) => c['id'] == _selectedComponentId,
+                                    orElse: () => null,
+                                  );
+                                  if (selectedComp == null) return const SizedBox.shrink();
+                                  return Card(
+                                    color: const Color(0x33004D40),
+                                    shape: RoundedRectangleBorder(
+                                      borderRadius: BorderRadius.circular(12),
+                                      side: BorderSide(color: Colors.teal.shade800),
+                                    ),
+                                    child: Padding(
+                                      padding: const EdgeInsets.all(10.0),
+                                      child: Row(
+                                        children: [
+                                          selectedComp['is_builtin'] == true
+                                              ? const Icon(Icons.apps, size: 36, color: Colors.tealAccent)
+                                              : Builder(
+                                                  builder: (context) {
+                                                    final local = _getLocalComponent(selectedComp['id']);
+                                                    if (local != null) {
+                                                      return Image.memory(
+                                                        local.iconBytes,
+                                                        width: 36,
+                                                        height: 36,
+                                                      );
+                                                    }
+                                                    return const Icon(Icons.image, size: 36);
+                                                  },
+                                                ),
+                                          const SizedBox(width: 10),
+                                          Expanded(
+                                            child: Column(
+                                              crossAxisAlignment: CrossAxisAlignment.start,
+                                              children: [
+                                                Text(
+                                                  selectedComp['name'] ?? '',
+                                                  style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13),
+                                                ),
+                                                Text(
+                                                  selectedComp['description'] ?? '',
+                                                  maxLines: 2,
+                                                  overflow: TextOverflow.ellipsis,
+                                                  style: const TextStyle(fontSize: 10, color: Colors.grey),
+                                                ),
+                                                const SizedBox(height: 2),
+                                                Text(
+                                                  'Vitesse ATB : ${selectedComp['atb_vitesse'] ?? 10}',
+                                                  style: const TextStyle(fontSize: 9, color: Colors.tealAccent),
+                                                ),
+                                              ],
+                                            ),
+                                          ),
+                                        ],
+                                      ),
+                                    ),
+                                  );
+                                }
+                              ),
+                            ],
+                          ],
+                        ),
                       ),
-                    ],
-                    const Spacer(),
+                    ),
+                    const Divider(),
+                    const SizedBox(height: 8),
                     const Text(
                       'Astuce : Utilisez la molette ou pincez pour zoomer. Glissez pour vous déplacer dans le monde.',
                       style: TextStyle(color: Colors.grey, fontSize: 11),
@@ -848,6 +1244,7 @@ def generer_grille(width, height):
                             onPaintCell: _handleCellPaint,
                             iconCache: _iconCache,
                             activeTool: _activeTool,
+                            bubbleImage: _bubbleImage,
                           ),
                   ),
                   // Chevron flottant pour ouvrir le panneau si fermé
@@ -929,6 +1326,20 @@ def generer_grille(width, height):
     final String colorHex = comp != null ? (comp['couleur'] ?? '#000000') : '#000000';
     final String shape = comp != null ? (comp['forme'] ?? 'carré').toString().toLowerCase() : 'carré';
 
+    final String typeId = comp != null ? (comp['type_id'] ?? '') : '';
+    final local = typeId.isNotEmpty ? _getLocalComponent(typeId) : null;
+    final String? variant = comp != null ? comp['icon_variant'] : null;
+    Uint8List? displayIconBytes;
+    if (local != null) {
+      if (variant == 'M' && local.iconMBytes != null) {
+        displayIconBytes = local.iconMBytes;
+      } else if (variant == 'F' && local.iconFBytes != null) {
+        displayIconBytes = local.iconFBytes;
+      } else {
+        displayIconBytes = local.iconBytes;
+      }
+    }
+
     return Card(
       elevation: 4,
       color: cardColor,
@@ -950,33 +1361,42 @@ def generer_grille(width, height):
                   bottom: BorderSide(color: borderColor, width: 1.5),
                 ),
               ),
-              child: comp['type_id'] != null
-                  ? Image.network(
-                      '${ApiClient.baseUrl}/api/components/${comp['type_id']}/icon',
-                      fit: BoxFit.cover,
+              child: displayIconBytes != null
+                  ? Image.memory(
+                      displayIconBytes,
+                      fit: BoxFit.contain,
                       width: double.infinity,
                       height: 180,
-                      errorBuilder: (context, error, stackTrace) => Container(
-                        color: _parseHexColor(colorHex).withValues(alpha: 0.2),
-                        child: Center(
-                          child: Icon(
-                            _getShapeIcon(shape),
-                            color: _parseHexColor(colorHex),
-                            size: 64,
-                          ),
-                        ),
-                      ),
                     )
-                  : Container(
-                      color: _parseHexColor(colorHex).withValues(alpha: 0.2),
-                      child: Center(
-                        child: Icon(
-                          _getShapeIcon(shape),
-                          color: _parseHexColor(colorHex),
-                          size: 64,
-                        ),
-                      ),
-                    ),
+                  : (comp['type_id'] != null
+                      ? Image.network(
+                          comp['icon_variant'] != null
+                              ? '${ApiClient.baseUrl}/api/components/${comp['type_id']}/icon?variant=${comp['icon_variant']}'
+                              : '${ApiClient.baseUrl}/api/components/${comp['type_id']}/icon',
+                          fit: BoxFit.contain,
+                          width: double.infinity,
+                          height: 180,
+                          errorBuilder: (context, error, stackTrace) => Container(
+                            color: _parseHexColor(colorHex).withValues(alpha: 0.2),
+                            child: Center(
+                              child: Icon(
+                                _getShapeIcon(shape),
+                                color: _parseHexColor(colorHex),
+                                size: 64,
+                              ),
+                            ),
+                          ),
+                        )
+                      : Container(
+                          color: _parseHexColor(colorHex).withValues(alpha: 0.2),
+                          child: Center(
+                            child: Icon(
+                              _getShapeIcon(shape),
+                              color: _parseHexColor(colorHex),
+                              size: 64,
+                            ),
+                          ),
+                        )),
             ),
           ],
           Padding(
@@ -1366,7 +1786,117 @@ def generer_grille(width, height):
               textAlign: TextAlign.center,
             ),
           ),
+        const SizedBox(height: 24),
+        const Text(
+          'Journal des Dialogues (Gemini)',
+          style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13, color: Colors.tealAccent),
+        ),
+        const SizedBox(height: 8),
+        _buildDialoguesLog(_gameState != null ? (_gameState!['dialogues'] ?? []) : []),
       ],
+    );
+  }
+
+  Widget _buildDialoguesLog(List<dynamic> dialogues) {
+    if (dialogues.isEmpty) {
+      return const Padding(
+        padding: EdgeInsets.symmetric(vertical: 16.0),
+        child: Text(
+          'Aucune discussion enregistrée. Rapprochez deux humains avec la clé API Gemini configurée pour lancer les discussions.',
+          style: TextStyle(color: Colors.grey, fontSize: 11, fontStyle: FontStyle.italic),
+          textAlign: TextAlign.center,
+        ),
+      );
+    }
+
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.stretch,
+      children: dialogues.reversed.map<Widget>((dynamic d) {
+        final String speaker = d['speaker_name'] ?? 'Humain';
+        final String listener = d['listener_name'] ?? 'Humain';
+        final String phrase = d['phrase'] ?? '';
+        final int sentiment = d['sentiment'] ?? 0;
+        final int tick = d['tick'] ?? 0;
+
+        Color sentimentColor;
+        IconData sentimentIcon;
+        if (sentiment > 3) {
+          sentimentColor = Colors.pinkAccent;
+          sentimentIcon = Icons.favorite;
+        } else if (sentiment > 0) {
+          sentimentColor = Colors.greenAccent;
+          sentimentIcon = Icons.sentiment_satisfied;
+        } else if (sentiment < -3) {
+          sentimentColor = Colors.redAccent;
+          sentimentIcon = Icons.sentiment_very_dissatisfied;
+        } else if (sentiment < 0) {
+          sentimentColor = Colors.orangeAccent;
+          sentimentIcon = Icons.sentiment_dissatisfied;
+        } else {
+          sentimentColor = Colors.grey;
+          sentimentIcon = Icons.chat_bubble_outline;
+        }
+
+        return Card(
+          color: const Color(0x33008080),
+          margin: const EdgeInsets.symmetric(vertical: 6),
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+          child: Padding(
+            padding: const EdgeInsets.all(10.0),
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Row(
+                  mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                  children: [
+                    Text(
+                      '$speaker ➔ $listener',
+                      style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 11, color: Colors.tealAccent),
+                    ),
+                    Row(
+                      children: [
+                        if (d['intime'] == true) ...[
+                          Container(
+                            padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+                            margin: const EdgeInsets.only(right: 8),
+                            decoration: BoxDecoration(
+                              color: sentimentColor.withValues(alpha: 0.15),
+                              borderRadius: BorderRadius.circular(4),
+                              border: Border.all(color: sentimentColor.withValues(alpha: 0.4), width: 0.5),
+                            ),
+                            child: Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                Icon(Icons.lock_outline, size: 10, color: sentimentColor),
+                                const SizedBox(width: 2),
+                                Text(
+                                  'Intime',
+                                  style: TextStyle(fontSize: 8, color: sentimentColor, fontWeight: FontWeight.bold),
+                                ),
+                              ],
+                            ),
+                          ),
+                        ],
+                        Icon(sentimentIcon, size: 12, color: sentimentColor),
+                        const SizedBox(width: 4),
+                        Text(
+                          'Tick $tick',
+                          style: const TextStyle(fontSize: 10, color: Colors.grey),
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 6),
+                Text(
+                  '"$phrase"',
+                  style: const TextStyle(fontSize: 12, fontStyle: FontStyle.italic, color: Colors.white),
+                ),
+              ],
+            ),
+          ),
+        );
+      }).toList(),
     );
   }
 

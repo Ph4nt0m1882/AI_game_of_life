@@ -3,7 +3,12 @@ import 'dart:typed_data';
 import 'package:flutter/material.dart';
 import 'package:file_picker/file_picker.dart';
 import 'dart:io' as io;
+import 'package:flutter/foundation.dart' show kIsWeb;
+import 'package:archive/archive.dart';
 import '../services/api_client.dart';
+import '../services/client_settings.dart';
+import '../services/local_components_manager.dart';
+import '../services/web_download_helper.dart';
 import '../widgets/avatar_preview.dart';
 
 class ComponentMakerTab extends StatefulWidget {
@@ -21,6 +26,11 @@ class _ComponentMakerTabState extends State<ComponentMakerTab> {
   
   Uint8List? _selectedIconBytes;
   String? _selectedIconName;
+  Uint8List? _selectedIconMBytes;
+  String? _selectedIconMName;
+  Uint8List? _selectedIconFBytes;
+  String? _selectedIconFName;
+  String? _editingComponentId;
 
   String _selectedForme = "carré";
   String _selectedCoin = "droit";
@@ -41,18 +51,16 @@ class _ComponentMakerTabState extends State<ComponentMakerTab> {
 
   // Code Python de base par défaut
   final _logicController = TextEditingController(text: '''from core.composant import Composant
+import random
 
 class MonComposant(Composant):
     def __init__(self, x, y, atb_vitesse=10):
         super().__init__(x, y, atb_vitesse)
-        self.type_nom = "MonComposant"
-        self.forme = "triangle"  # formes valides : carré, carré_arrondi, cercle, triangle, triangle_inverse
-        self.couleur = "#00FF00"  # Couleur hexadécimale de départ (Vert)
+        self.sexe = random.choice(['M', 'F'])
 
     def action(self, simulation):
         # Action exécutée lorsque l'ATB atteint 100
         # Exemple : déplacement aléatoire sur la terre
-        import random
         dx = random.choice([-1, 0, 1])
         dy = random.choice([-1, 0, 1])
         nx, ny = self.x + dx, self.y + dy
@@ -62,13 +70,11 @@ class MonComposant(Composant):
             self.x = nx
             self.y = ny
             simulation.grille_entites[(self.x, self.y)] = self
-            
-        # Exemple de couleur dynamique : changer de couleur de façon aléatoire à chaque tick d'action
-        # self.couleur = random.choice(["#FF0000", "#00FF00", "#0000FF", "#FFFF00"])
 
     def stats(self):
         """Retourne des statistiques spécifiques affichées dans l'inspecteur."""
         return {
+            "Sexe": (self.sexe, "string"),
             "Statut": ("Actif", "string"),
             "Énergie": (100, "percent"),
             "Position": (f"({self.x}, {self.y})", "position")
@@ -92,9 +98,28 @@ class MonComposant(Composant):
 
   Future<void> _fetchExistingComponents() async {
     try {
-      final fetchedComps = await ApiClient.fetchComponents();
+      final localComps = await LocalComponentsManager.scanLocalComponents();
+      final List<dynamic> localMeta = localComps.map((c) => c.toMetadata()).toList();
+
+      List<dynamic> serverComps = [];
+      try {
+        serverComps = await ApiClient.fetchComponents();
+      } catch (e) {
+        // Ignorer
+      }
+
+      final Map<String, dynamic> merged = {};
+      for (var c in serverComps) {
+        if (c['is_builtin'] == true) {
+          merged[c['id']] = c;
+        }
+      }
+      for (var c in localMeta) {
+        merged[c['id']] = c;
+      }
+
       setState(() {
-        _existingComponents = fetchedComps;
+        _existingComponents = merged.values.toList();
         if (_selectedTargetId == null || !_existingComponents.any((c) => c['id'] == _selectedTargetId)) {
           _selectedTargetId = _existingComponents.isNotEmpty ? _existingComponents.first['id'] : null;
         }
@@ -129,6 +154,56 @@ class MonComposant(Composant):
     }
   }
 
+  Future<void> _pickIconM() async {
+    final result = await FilePicker.pickFiles(
+      type: FileType.custom,
+      allowedExtensions: ['png'],
+      withData: true,
+    );
+    if (result != null && result.files.isNotEmpty) {
+      final file = result.files.first;
+      Uint8List? bytes = file.bytes;
+      if (bytes == null && file.path != null) {
+        try {
+          bytes = io.File(file.path!).readAsBytesSync();
+        } catch (e) {
+          // Ignorer
+        }
+      }
+      if (bytes != null) {
+        setState(() {
+          _selectedIconMBytes = bytes;
+          _selectedIconMName = file.name;
+        });
+      }
+    }
+  }
+
+  Future<void> _pickIconF() async {
+    final result = await FilePicker.pickFiles(
+      type: FileType.custom,
+      allowedExtensions: ['png'],
+      withData: true,
+    );
+    if (result != null && result.files.isNotEmpty) {
+      final file = result.files.first;
+      Uint8List? bytes = file.bytes;
+      if (bytes == null && file.path != null) {
+        try {
+          bytes = io.File(file.path!).readAsBytesSync();
+        } catch (e) {
+          // Ignorer
+        }
+      }
+      if (bytes != null) {
+        setState(() {
+          _selectedIconFBytes = bytes;
+          _selectedIconFName = file.name;
+        });
+      }
+    }
+  }
+
   void _addInteraction() {
     if (_selectedTargetId == null || _interactionDescController.text.trim().isEmpty) return;
     setState(() {
@@ -143,9 +218,17 @@ class MonComposant(Composant):
     });
   }
 
+  LocalComponent? _getLocalComponent(String id) {
+    try {
+      return LocalComponentsManager.cachedComponents.firstWhere((c) => c.id == id);
+    } catch (e) {
+      return null;
+    }
+  }
+
   Future<void> _buildAndSave() async {
     if (!_formKey.currentState!.validate()) return;
-    if (_selectedIconBytes == null) {
+    if (_selectedIconBytes == null && _editingComponentId == null) {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('Veuillez sélectionner une icône PNG pour le composant.'), backgroundColor: Colors.orange),
       );
@@ -158,25 +241,85 @@ class MonComposant(Composant):
     });
 
     try {
-      final response = await ApiClient.buildComponent(
-        name: _nameController.text,
-        description: _descController.text,
-        vitesse: _atbSpeed.toInt(),
-        logicPy: _logicController.text,
-        interactionsJson: json.encode(_localInteractions),
-        forme: _selectedForme,
-        coin: _selectedCoin,
-        orientation: _selectedOrientation,
-        couleur: _colorController.text,
-        iconBytes: _selectedIconBytes!,
-        iconFilename: _selectedIconName ?? 'icon.png',
-      );
+      final String compId = _editingComponentId ??
+          '${_nameController.text.toLowerCase().replaceAll(RegExp(r'[^a-z0-9_]'), '_')}_${DateTime.now().millisecondsSinceEpoch.toRadixString(16).substring(0, 4)}';
+
+      final manifest = {
+        "id": compId,
+        "name": _nameController.text,
+        "description": _descController.text,
+        "atb_vitesse": _atbSpeed.toInt(),
+        "forme": _selectedForme,
+        "coin": _selectedCoin,
+        "orientation": _selectedOrientation,
+        "couleur": _colorController.text,
+        "interactions": _localInteractions,
+        "has_icon_m": _selectedIconMBytes != null,
+        "has_icon_f": _selectedIconFBytes != null,
+      };
+      final manifestJson = json.encode(manifest);
+
+      final archive = Archive();
+      
+      final manifestBytes = utf8.encode(manifestJson);
+      archive.addFile(ArchiveFile('manifest.json', manifestBytes.length, manifestBytes));
+      
+      final logicBytes = utf8.encode(_logicController.text);
+      archive.addFile(ArchiveFile('logic.py', logicBytes.length, logicBytes));
+      
+      Uint8List? iconBytes = _selectedIconBytes;
+      if (iconBytes == null && _editingComponentId != null) {
+        final existing = _getLocalComponent(_editingComponentId!);
+        if (existing != null) {
+          iconBytes = existing.iconBytes;
+        }
+      }
+      if (iconBytes == null) {
+        throw Exception("Une icône principale est requise.");
+      }
+      archive.addFile(ArchiveFile('icon.png', iconBytes.length, iconBytes));
+
+      Uint8List? iconMBytes = _selectedIconMBytes;
+      Uint8List? iconFBytes = _selectedIconFBytes;
+      if (_editingComponentId != null) {
+        final existing = _getLocalComponent(_editingComponentId!);
+        if (existing != null) {
+          iconMBytes ??= existing.iconMBytes;
+          iconFBytes ??= existing.iconFBytes;
+        }
+      }
+      if (iconMBytes != null) {
+        archive.addFile(ArchiveFile('icon_M.png', iconMBytes.length, iconMBytes));
+      }
+      if (iconFBytes != null) {
+        archive.addFile(ArchiveFile('icon_F.png', iconFBytes.length, iconFBytes));
+      }
+
+      final zipBytes = Uint8List.fromList(ZipEncoder().encode(archive)!);
+
+      final response = await ApiClient.uploadComponent(zipBytes, '$compId.sssub');
 
       if (response.statusCode == 200) {
-        if (mounted) {
-          ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(content: Text('Composant généré et chargé avec succès !'), backgroundColor: Colors.green),
-          );
+        if (kIsWeb) {
+          downloadFile(zipBytes, '$compId.sssub');
+          final newComp = await LocalComponentsManager.loadFromSssubBytes(zipBytes, '$compId.sssub', '$compId.sssub');
+          if (newComp != null) {
+            LocalComponentsManager.addWebComponent(newComp);
+          }
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              const SnackBar(content: Text('Composant généré et téléchargé avec succès !'), backgroundColor: Colors.green),
+            );
+          }
+        } else {
+          final workspacePath = await ClientSettings.getWorkspacePath();
+          final file = io.File('$workspacePath/$compId.sssub');
+          await file.writeAsBytes(zipBytes);
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              const SnackBar(content: Text('Composant généré et enregistré localement avec succès !'), backgroundColor: Colors.green),
+            );
+          }
         }
         // Reset form
         setState(() {
@@ -184,11 +327,16 @@ class MonComposant(Composant):
           _descController.clear();
           _selectedIconBytes = null;
           _selectedIconName = null;
+          _selectedIconMBytes = null;
+          _selectedIconMName = null;
+          _selectedIconFBytes = null;
+          _selectedIconFName = null;
           _localInteractions.clear();
           _selectedForme = "carré";
           _selectedCoin = "droit";
           _selectedOrientation = "standard";
           _colorController.text = "#008080";
+          _editingComponentId = null;
         });
         _fetchExistingComponents();
       } else {
@@ -199,7 +347,7 @@ class MonComposant(Composant):
       }
     } catch (e) {
       setState(() {
-        _compilerError = 'Impossible de se connecter au serveur backend : $e';
+        _compilerError = 'Erreur lors de la validation ou de la génération : $e';
       });
     } finally {
       setState(() {
@@ -232,56 +380,90 @@ class MonComposant(Composant):
       });
 
       try {
-        final response = await ApiClient.uploadComponent(bytes, file.name);
+        // Décoder l'archive ZIP localement
+        final archive = ZipDecoder().decodeBytes(bytes);
+        
+        Map<String, dynamic>? manifest;
+        Uint8List? iconBytes;
+        Uint8List? iconMBytes;
+        Uint8List? iconFBytes;
+        String? logicPy;
 
-        if (response.statusCode == 200) {
-          final data = json.decode(response.body);
-          final meta = data['metadata'] ?? {};
-          final String logicPy = data['logic_py'] ?? '';
-          final String iconBase64 = data['icon_base64'] ?? '';
-
-          setState(() {
-            _nameController.text = meta['name'] ?? '';
-            _descController.text = meta['description'] ?? '';
-            _colorController.text = meta['couleur'] ?? '#008080';
-            _atbSpeed = (meta['atb_vitesse'] ?? 10).toDouble();
-            _selectedForme = meta['forme'] ?? 'carré';
-            _selectedCoin = meta['coin'] ?? 'droit';
-            _selectedOrientation = meta['orientation'] ?? 'standard';
-            _logicController.text = logicPy;
-            if (iconBase64.isNotEmpty) {
-              _selectedIconBytes = base64.decode(iconBase64);
-              _selectedIconName = 'icon.png';
-            } else {
-              _selectedIconBytes = null;
-              _selectedIconName = null;
-            }
-            
-            // Charger les interactions
-            _localInteractions.clear();
-            final rawInteractions = meta['interactions'];
-            if (rawInteractions is Map) {
-              rawInteractions.forEach((key, value) {
-                _localInteractions[key.toString()] = value.toString();
-              });
-            }
-          });
-
-          if (mounted) {
-            ScaffoldMessenger.of(context).showSnackBar(
-              SnackBar(content: Text('Composant "${meta['name']}" importé et chargé dans l\'éditeur !'), backgroundColor: Colors.green),
-            );
+        for (final archiveFile in archive) {
+          if (archiveFile.name == 'manifest.json') {
+            final content = utf8.decode(archiveFile.content as List<int>);
+            manifest = json.decode(content) as Map<String, dynamic>;
+          } else if (archiveFile.name == 'icon.png') {
+            iconBytes = Uint8List.fromList(archiveFile.content as List<int>);
+          } else if (archiveFile.name == 'icon_M.png') {
+            iconMBytes = Uint8List.fromList(archiveFile.content as List<int>);
+          } else if (archiveFile.name == 'icon_F.png') {
+            iconFBytes = Uint8List.fromList(archiveFile.content as List<int>);
+          } else if (archiveFile.name == 'logic.py') {
+            logicPy = utf8.decode(archiveFile.content as List<int>, allowMalformed: true);
           }
-          _fetchExistingComponents();
-        } else {
-          final errorDetail = json.decode(response.body)['detail'] ?? 'Erreur inconnue';
-          setState(() {
-            _compilerError = errorDetail.toString();
-          });
         }
+
+        if (manifest == null || logicPy == null) {
+          throw Exception("Le fichier .sssub est invalide ou corrompu (manifest.json ou logic.py manquant).");
+        }
+
+        final manifestData = manifest;
+        final targetId = manifestData['id'] ?? file.name.replaceAll('.sssub', '');
+
+        setState(() {
+          _nameController.text = manifestData['name'] ?? '';
+          _descController.text = manifestData['description'] ?? '';
+          _colorController.text = manifestData['couleur'] ?? '#008080';
+          _atbSpeed = (manifestData['atb_vitesse'] ?? 10).toDouble();
+          _selectedForme = manifestData['forme'] ?? 'carré';
+          _selectedCoin = manifestData['coin'] ?? 'droit';
+          _selectedOrientation = manifestData['orientation'] ?? 'standard';
+          _logicController.text = logicPy ?? '';
+          _editingComponentId = targetId;
+          
+          if (iconBytes != null) {
+            _selectedIconBytes = iconBytes;
+            _selectedIconName = 'icon.png';
+          } else {
+            _selectedIconBytes = null;
+            _selectedIconName = null;
+          }
+
+          if (iconMBytes != null) {
+            _selectedIconMBytes = iconMBytes;
+            _selectedIconMName = 'icon_M.png';
+          } else {
+            _selectedIconMBytes = null;
+            _selectedIconMName = null;
+          }
+
+          if (iconFBytes != null) {
+            _selectedIconFBytes = iconFBytes;
+            _selectedIconFName = 'icon_F.png';
+          } else {
+            _selectedIconFBytes = null;
+            _selectedIconFName = null;
+          }
+          
+          _localInteractions.clear();
+          final rawInteractions = manifestData['interactions'];
+          if (rawInteractions is Map) {
+            rawInteractions.forEach((key, value) {
+              _localInteractions[key.toString()] = value.toString();
+            });
+          }
+        });
+
+        if (mounted) {
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(content: Text('Composant "${manifestData['name'] ?? targetId}" importé localement dans l\'éditeur !'), backgroundColor: Colors.green),
+          );
+        }
+        _fetchExistingComponents();
       } catch (e) {
         setState(() {
-          _compilerError = 'Erreur lors de l\'importation : $e';
+          _compilerError = 'Erreur lors de l\'importation locale : $e';
         });
       } finally {
         setState(() {
@@ -312,21 +494,57 @@ class MonComposant(Composant):
                     child: Column(
                       crossAxisAlignment: CrossAxisAlignment.stretch,
                       children: [
-                        Row(
-                          mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                        Wrap(
+                          spacing: 12,
+                          runSpacing: 8,
+                          alignment: WrapAlignment.spaceBetween,
+                          crossAxisAlignment: WrapCrossAlignment.center,
                           children: [
-                            const Text(
-                              'Créateur de Composants',
-                              style: TextStyle(fontSize: 20, fontWeight: FontWeight.bold, color: Colors.tealAccent),
+                            Text(
+                              _editingComponentId == null
+                                  ? 'Créateur de Composants'
+                                  : 'Créateur de Composants (Édition)',
+                              style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold, color: Colors.tealAccent),
                             ),
-                            ElevatedButton.icon(
-                              onPressed: _importSssub,
-                              icon: const Icon(Icons.file_upload),
-                              label: const Text('Importer .sssub'),
-                              style: ElevatedButton.styleFrom(
-                                backgroundColor: Colors.teal.shade900,
-                              ),
-                            )
+                            Wrap(
+                              spacing: 8,
+                              runSpacing: 8,
+                              crossAxisAlignment: WrapCrossAlignment.center,
+                              children: [
+                                if (_editingComponentId != null)
+                                  TextButton.icon(
+                                    onPressed: () {
+                                      setState(() {
+                                        _nameController.clear();
+                                        _descController.clear();
+                                        _selectedIconBytes = null;
+                                        _selectedIconName = null;
+                                        _selectedIconMBytes = null;
+                                        _selectedIconMName = null;
+                                        _selectedIconFBytes = null;
+                                        _selectedIconFName = null;
+                                        _localInteractions.clear();
+                                        _selectedForme = "carré";
+                                        _selectedCoin = "droit";
+                                        _selectedOrientation = "standard";
+                                        _colorController.text = "#008080";
+                                        _editingComponentId = null;
+                                      });
+                                    },
+                                    icon: const Icon(Icons.clear, color: Colors.orangeAccent, size: 18),
+                                    label: const Text('Nouveau / Effacer', style: TextStyle(color: Colors.orangeAccent, fontSize: 13)),
+                                  ),
+                                ElevatedButton.icon(
+                                  onPressed: _importSssub,
+                                  icon: const Icon(Icons.file_upload, size: 16),
+                                  label: const Text('Importer .sssub', style: TextStyle(fontSize: 12)),
+                                  style: ElevatedButton.styleFrom(
+                                    backgroundColor: Colors.teal.shade900,
+                                    padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
+                                  ),
+                                ),
+                              ],
+                            ),
                           ],
                         ),
                         const SizedBox(height: 16),
@@ -401,6 +619,92 @@ class MonComposant(Composant):
                                 ),
                               ),
                             ]
+                          ],
+                        ),
+                        const SizedBox(height: 12),
+                        Row(
+                          children: [
+                            Expanded(
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  ElevatedButton.icon(
+                                    onPressed: _pickIconM,
+                                    icon: const Icon(Icons.male, size: 16),
+                                    label: Text(
+                                      _selectedIconMName != null
+                                          ? 'M: ${_selectedIconMName!.length > 15 ? "${_selectedIconMName!.substring(0, 12)}..." : _selectedIconMName}'
+                                          : 'Icône Mâle (Optionnel)',
+                                      style: const TextStyle(fontSize: 11),
+                                    ),
+                                    style: ElevatedButton.styleFrom(
+                                      backgroundColor: Colors.blue.shade900.withValues(alpha: 0.4),
+                                    ),
+                                  ),
+                                  if (_selectedIconMBytes != null) ...[
+                                    const SizedBox(height: 4),
+                                    Center(
+                                      child: Container(
+                                        width: 40,
+                                        height: 40,
+                                        decoration: BoxDecoration(
+                                          border: Border.all(color: Colors.blueAccent),
+                                          borderRadius: BorderRadius.circular(8),
+                                        ),
+                                        child: ClipRRect(
+                                          borderRadius: BorderRadius.circular(8),
+                                          child: Image.memory(
+                                            _selectedIconMBytes!,
+                                            fit: BoxFit.cover,
+                                          ),
+                                        ),
+                                      ),
+                                    ),
+                                  ],
+                                ],
+                              ),
+                            ),
+                            const SizedBox(width: 16),
+                            Expanded(
+                              child: Column(
+                                crossAxisAlignment: CrossAxisAlignment.start,
+                                children: [
+                                  ElevatedButton.icon(
+                                    onPressed: _pickIconF,
+                                    icon: const Icon(Icons.female, size: 16),
+                                    label: Text(
+                                      _selectedIconFName != null
+                                          ? 'F: ${_selectedIconFName!.length > 15 ? "${_selectedIconFName!.substring(0, 12)}..." : _selectedIconFName}'
+                                          : 'Icône Femelle (Optionnel)',
+                                      style: const TextStyle(fontSize: 11),
+                                    ),
+                                    style: ElevatedButton.styleFrom(
+                                      backgroundColor: Colors.pink.shade900.withValues(alpha: 0.4),
+                                    ),
+                                  ),
+                                  if (_selectedIconFBytes != null) ...[
+                                    const SizedBox(height: 4),
+                                    Center(
+                                      child: Container(
+                                        width: 40,
+                                        height: 40,
+                                        decoration: BoxDecoration(
+                                          border: Border.all(color: Colors.pinkAccent),
+                                          borderRadius: BorderRadius.circular(8),
+                                        ),
+                                        child: ClipRRect(
+                                          borderRadius: BorderRadius.circular(8),
+                                          child: Image.memory(
+                                            _selectedIconFBytes!,
+                                            fit: BoxFit.cover,
+                                          ),
+                                        ),
+                                      ),
+                                    ),
+                                  ],
+                                ],
+                              ),
+                            ),
                           ],
                         ),
                         const SizedBox(height: 24),

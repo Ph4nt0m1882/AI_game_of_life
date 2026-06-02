@@ -1,6 +1,10 @@
 import math
 import random
+import os
+from dotenv import load_dotenv
 from core.scheduler import Scheduler
+
+load_dotenv()
 
 class Simulation:
     def __init__(self, width=80, height=80, noyade_active=True):
@@ -11,6 +15,8 @@ class Simulation:
         self.grille = [] # 0: Eau, 1: Terre
         self.composants = {} # id -> composant
         self.grille_entites = {} # (x, y) -> composant
+        self.gemini_api_key = os.getenv("API_KEY", "")
+        self.dialogues = []
         
         self.generer_ile("circular")
         self.generer_cellules_initiales()
@@ -198,9 +204,12 @@ class Simulation:
         return False
 
     def creer_composant(self, type_id, x, y, atb_vitesse=None):
-        from core.loader import LOADED_CLASSES, METADATA_REGISTRY
+        from core.loader import LOADED_CLASSES, METADATA_REGISTRY, load_component_class
         if type_id not in LOADED_CLASSES:
-            raise ValueError(f"Composant de type '{type_id}' inconnu.")
+            try:
+                load_component_class(type_id)
+            except Exception as e:
+                raise ValueError(f"Composant de type '{type_id}' inconnu ou impossible à charger : {e}")
         cls = LOADED_CLASSES[type_id]
         
         if atb_vitesse is not None:
@@ -235,7 +244,8 @@ class Simulation:
                 if comp.vivant:
                     if not self.is_terre(comp.x, comp.y):
                         comp.noyade_ticks = getattr(comp, "noyade_ticks", 0) + 1
-                        if comp.noyade_ticks >= 3:
+                        limit = getattr(comp, "noyade_limite", 3)
+                        if comp.noyade_ticks >= limit:
                             comp.vivant = False
                     else:
                         comp.noyade_ticks = 0
@@ -268,5 +278,6 @@ class Simulation:
             "grille": self.grille,
             "noyade_active": self.noyade_active,
             "composants": [c.to_dict() for c in self.composants.values()],
-            "global_stats": self.get_global_stats()
+            "global_stats": self.get_global_stats(),
+            "dialogues": getattr(self, "dialogues", [])
         }

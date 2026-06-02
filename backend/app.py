@@ -1,6 +1,9 @@
 import asyncio
 import uuid
 import json
+import os
+from dotenv import load_dotenv
+from typing import Optional, Dict, Any
 import core.loader
 from fastapi import FastAPI, HTTPException, Form, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
@@ -9,6 +12,8 @@ from pydantic import BaseModel
 from simulation import Simulation
 import uvicorn
 from core.loader import init_loader, build_sssub, import_sssub, save_settings_dir
+
+load_dotenv()
 
 app = FastAPI()
 
@@ -43,16 +48,32 @@ class GenerateMapRequest(BaseModel):
 
 class SimulationSettingsRequest(BaseModel):
     noyade_active: bool
+    speed_factor: float = 1.0
+    gemini_api_key: str = ""
 
 
 
 async def simulation_loop():
+    import time
+    last_time = time.perf_counter()
     while True:
+        await asyncio.sleep(0.005) # 5ms precision sleep
+        now = time.perf_counter()
+        dt = now - last_time
+        last_time = now
+        
         for sim_id, sim_data in list(simulations.items()):
             if sim_data["is_running"]:
-                sim_data["sim"].tick()
-        # 30 ticks par seconde max
-        await asyncio.sleep(1/30)
+                speed = sim_data.get("speed_factor", 1.0)
+                # 1.0 speed = 30 ticks per second, meaning 1 tick every 0.03333 seconds
+                tick_interval = 0.03333 / speed
+                
+                accumulated = sim_data.get("accumulated_time", 0.0) + dt
+                ticks_to_run = int(accumulated // tick_interval)
+                sim_data["accumulated_time"] = accumulated % tick_interval
+                
+                for _ in range(min(ticks_to_run, 20)): # Cap at 20 ticks per loop to prevent lockup
+                    sim_data["sim"].tick()
 
 @app.on_event("startup")
 async def startup_event():
@@ -65,13 +86,15 @@ def create_new_sim():
     # On augmente la taille par défaut pour éviter le blocage trop rapide (ex: 80x80)
     simulations[sim_id] = {
         "sim": Simulation(width=80, height=80),
-        "is_running": False
+        "is_running": False,
+        "speed_factor": 1.0,
+        "accumulated_time": 0.0
     }
     return {"sim_id": sim_id}
 
 @app.get("/api/simulations")
 def list_sims():
-    return [{"id": k, "is_running": v["is_running"]} for k, v in simulations.items()]
+    return [{"id": k, "is_running": v["is_running"], "speed_factor": v.get("speed_factor", 1.0)} for k, v in simulations.items()]
 
 @app.get("/api/simulations/{sim_id}/state")
 def get_state(sim_id: str):
@@ -97,15 +120,37 @@ def stop_sim(sim_id: str):
 
 @app.get("/api/components")
 def get_components():
-    """Retourne la liste de tous les composants enregistrés."""
+    """Retourne la liste de tous les composants enregistrés après rescan dynamique."""
+    core.loader.scan_custom_components()
     return core.loader.METADATA_REGISTRY
 
 @app.get("/api/components/{comp_id}/icon")
-def get_component_icon(comp_id: str):
-    """Sert l'icône d'un composant personnalisé."""
-    icon_path = core.loader.EXTRACTED_DIR / comp_id / "icon.png"
-    if icon_path.exists():
-        return FileResponse(str(icon_path))
+def get_component_icon(comp_id: str, variant: Optional[str] = None):
+    """Sert l'icône directement depuis le fichier .sssub du workspace (Thumbnail Provider)."""
+    import zipfile
+    import io
+    from fastapi.responses import StreamingResponse
+    
+    zip_path = core.loader.CUSTOM_DIR / f"{comp_id}.sssub"
+    if not zip_path.exists():
+        raise HTTPException(status_code=404, detail="Composant non trouvé")
+        
+    try:
+        with zipfile.ZipFile(zip_path, 'r') as zip_file:
+            namelist = zip_file.namelist()
+            icon_name = "icon.png"
+            if variant:
+                clean_variant = "".join(c for c in variant if c.isalnum() or c in ("_", "-")).strip()
+                v_name = f"icon_{clean_variant}.png"
+                if v_name in namelist:
+                    icon_name = v_name
+                    
+            if icon_name in namelist:
+                with zip_file.open(icon_name) as f:
+                    return StreamingResponse(io.BytesIO(f.read()), media_type="image/png")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erreur de lecture de l'icône : {str(e)}")
+        
     raise HTTPException(status_code=404, detail="Icône non trouvée")
 
 @app.post("/api/components/build")
@@ -119,23 +164,59 @@ async def build_component(
     coin: str = Form("droit"),
     orientation: str = Form("standard"),
     couleur: str = Form("#000000"),
-    icon: UploadFile = File(...)
+    icon: Optional[UploadFile] = File(None),
+    icon_m: Optional[UploadFile] = File(None),
+    icon_f: Optional[UploadFile] = File(None),
+    comp_id: Optional[str] = Form(None)
 ):
-    """Crée un composant à partir des champs du Component Maker et l'enregistre."""
+    """Crée ou met à jour un composant à partir des champs du Component Maker et l'enregistre."""
     try:
-        icon_bytes = await icon.read()
-        
-        # Nettoyer le nom pour l'ID
-        clean_name = "".join(c for c in name if c.isalnum() or c in (" ", "_", "-")).strip()
-        comp_id = f"{clean_name.lower().replace(' ', '_')}_{uuid.uuid4().hex[:8]}"
-        
+        icon_bytes = b""
+        if icon is not None:
+            icon_bytes = await icon.read()
+        elif comp_id:
+            # Récupérer l'icône existante du composant
+            icon_path = core.loader.EXTRACTED_DIR / comp_id / "icon.png"
+            if icon_path.exists():
+                with open(icon_path, "rb") as f:
+                    icon_bytes = f.read()
+                    
+        if not icon_bytes:
+            raise ValueError("Une icône PNG est requise pour créer ou modifier ce composant.")
+            
+        icon_m_bytes = b""
+        if icon_m is not None:
+            icon_m_bytes = await icon_m.read()
+        elif comp_id:
+            icon_m_path = core.loader.EXTRACTED_DIR / comp_id / "icon_M.png"
+            if icon_m_path.exists():
+                with open(icon_m_path, "rb") as f:
+                    icon_m_bytes = f.read()
+
+        icon_f_bytes = b""
+        if icon_f is not None:
+            icon_f_bytes = await icon_f.read()
+        elif comp_id:
+            icon_f_path = core.loader.EXTRACTED_DIR / comp_id / "icon_F.png"
+            if icon_f_path.exists():
+                with open(icon_f_path, "rb") as f:
+                    icon_f_bytes = f.read()
+
+        # Si un comp_id est fourni, on l'utilise pour écraser, sinon on en génère un nouveau
+        if comp_id:
+            target_comp_id = comp_id
+        else:
+            # Nettoyer le nom pour l'ID
+            clean_name = "".join(c for c in name if c.isalnum() or c in (" ", "_", "-")).strip()
+            target_comp_id = f"{clean_name.lower().replace(' ', '_')}_{uuid.uuid4().hex[:8]}"
+            
         try:
             interactions_dict = json.loads(interactions)
         except Exception:
             interactions_dict = {}
             
-        build_sssub(
-            comp_id=comp_id,
+        zip_path = build_sssub(
+            comp_id=target_comp_id,
             name=name,
             description=description,
             atb_vitesse=atb_vitesse,
@@ -145,9 +226,35 @@ async def build_component(
             forme=forme,
             coin=coin,
             orientation=orientation,
-            couleur=couleur
+            couleur=couleur,
+            icon_m_bytes=icon_m_bytes if icon_m_bytes else None,
+            icon_f_bytes=icon_f_bytes if icon_f_bytes else None
         )
-        return {"status": "success", "id": comp_id}
+        
+        import base64
+        import shutil
+        
+        zip_base64 = ""
+        if zip_path.exists():
+            with open(zip_path, "rb") as f:
+                zip_base64 = base64.b64encode(f.read()).decode("utf-8")
+            try:
+                zip_path.unlink()
+            except Exception:
+                pass
+                
+        # Supprimer le dossier extrait temporaire pour rester complètement stateless
+        comp_dir = core.loader.EXTRACTED_DIR / target_comp_id
+        if comp_dir.exists():
+            shutil.rmtree(comp_dir, ignore_errors=True)
+            
+        # Retirer de LOADED_CLASSES pour rester stateless
+        core.loader.LOADED_CLASSES.pop(target_comp_id, None)
+        
+        # Mettre à jour le registre en mémoire du serveur pour enlever le composant qui vient d'être supprimé du disque
+        core.loader.METADATA_REGISTRY = [m for m in core.loader.METADATA_REGISTRY if m["id"] != target_comp_id]
+        
+        return {"status": "success", "id": target_comp_id, "zip_base64": zip_base64}
     except ValueError as ve:
         raise HTTPException(status_code=400, detail=str(ve))
     except Exception as e:
@@ -162,12 +269,14 @@ async def upload_component(file: UploadFile = File(...)):
         file_bytes = await file.read()
         manifest = import_sssub(file_bytes)
         
-        # Extraire le code logic.py et l'icône icon.png en base64 pour renvoi à l'éditeur
+        # Extraire le code logic.py et les icônes en base64 pour renvoi à l'éditeur
         import io
         import zipfile
         import base64
         logic_py = ""
         icon_base64 = ""
+        icon_m_base64 = ""
+        icon_f_base64 = ""
         try:
             with zipfile.ZipFile(io.BytesIO(file_bytes), 'r') as zip_file:
                 namelist = zip_file.namelist()
@@ -177,6 +286,12 @@ async def upload_component(file: UploadFile = File(...)):
                 if "icon.png" in namelist:
                     with zip_file.open("icon.png") as imgf:
                         icon_base64 = base64.b64encode(imgf.read()).decode("utf-8")
+                if "icon_M.png" in namelist:
+                    with zip_file.open("icon_M.png") as imgf:
+                        icon_m_base64 = base64.b64encode(imgf.read()).decode("utf-8")
+                if "icon_F.png" in namelist:
+                    with zip_file.open("icon_F.png") as imgf:
+                        icon_f_base64 = base64.b64encode(imgf.read()).decode("utf-8")
         except Exception:
             pass  # Si l'extraction échoue, on renvoie les chaînes vides
             
@@ -184,7 +299,9 @@ async def upload_component(file: UploadFile = File(...)):
             "status": "success",
             "metadata": manifest,
             "logic_py": logic_py,
-            "icon_base64": icon_base64
+            "icon_base64": icon_base64,
+            "icon_m_base64": icon_m_base64,
+            "icon_f_base64": icon_f_base64
         }
     except ValueError as ve:
         raise HTTPException(status_code=400, detail=str(ve))
@@ -265,13 +382,20 @@ def update_simulation_settings(sim_id: str, req: SimulationSettingsRequest):
     if sim_id not in simulations:
         raise HTTPException(status_code=404, detail="Simulation non trouvée")
     sim = simulations[sim_id]["sim"]
-    sim.noyade_active = req.noyade_active
-    if not sim.noyade_active:
-        sim.grille = [[1] * sim.width for _ in range(sim.height)]
-    else:
-        sim.generer_ile("circular")
-    return {"status": "success", "noyade_active": sim.noyade_active}
+    simulations[sim_id]["speed_factor"] = req.speed_factor
+    sim.gemini_api_key = req.gemini_api_key or os.getenv("API_KEY", "")
+    
+    # Ne régénérer que si le mode île (noyade) a changé
+    if sim.noyade_active != req.noyade_active:
+        sim.noyade_active = req.noyade_active
+        if not sim.noyade_active:
+            sim.grille = [[1] * sim.width for _ in range(sim.height)]
+        else:
+            sim.generer_ile("circular")
+            
+    return {"status": "success", "noyade_active": sim.noyade_active, "speed_factor": req.speed_factor}
 
 if __name__ == "__main__":
-    uvicorn.run("app:app", host="0.0.0.0", port=5000, reload=True)
+    uvicorn.run("app:app", host="0.0.0.0", port=5000)
+
 
