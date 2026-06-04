@@ -96,10 +96,14 @@ def list_sims():
     return [{"id": k, "is_running": v["is_running"], "speed_factor": v.get("speed_factor", 1.0)} for k, v in simulations.items()]
 
 @app.get("/api/simulations/{sim_id}/state")
-def get_state(sim_id: str):
+def get_state(sim_id: str, exclude_grid: bool = False):
     if sim_id not in simulations:
         raise HTTPException(status_code=404, detail="Simulation non trouvée")
-    return simulations[sim_id]["sim"].get_state()
+    state = simulations[sim_id]["sim"].get_state()
+    if exclude_grid:
+        state = dict(state)
+        state["grille"] = None
+    return state
 
 @app.post("/api/simulations/{sim_id}/start")
 def start_sim(sim_id: str):
@@ -548,17 +552,21 @@ def get_mmsb_plot(sim_id: str):
     ax.set_facecolor('none')
     
     try:
-        # Layout spring élastique pour le graphe
-        pos = nx.spring_layout(G, k=0.8, seed=42)
+        # Layout spring élastique pour le graphe adapté au nombre de nœuds
+        k_val = 1.5 / np.sqrt(N) if N > 0 else 0.1
+        pos = nx.spring_layout(G, k=k_val, seed=42)
         
         # Dessiner les liens (edges) en blanc transparent
         nx.draw_networkx_edges(G, pos, ax=ax, edge_color='#ffffff', alpha=0.3, width=1.5)
         
-        # Dessiner les nœuds (nodes)
-        nx.draw_networkx_nodes(G, pos, ax=ax, node_color=node_colors, node_size=800, alpha=0.9, edgecolors='#ffffff')
+        # Dessiner les nœuds (nodes) avec taille dynamique
+        node_size = max(150, min(800, int(800 * 20 / N))) if N > 0 else 400
+        nx.draw_networkx_nodes(G, pos, ax=ax, node_color=node_colors, node_size=node_size, alpha=0.9, edgecolors='#ffffff')
         
-        # Dessiner les étiquettes (labels)
-        nx.draw_networkx_labels(G, pos, labels, ax=ax, font_size=8, font_color='white', font_weight='bold')
+        # Dessiner les étiquettes (labels) seulement si N <= 60 pour éviter le chevauchement massif
+        if N <= 60:
+            font_size = max(4, min(8, int(160 / N))) if N > 0 else 8
+            nx.draw_networkx_labels(G, pos, labels, ax=ax, font_size=font_size, font_color='white', font_weight='bold')
     except Exception as e:
         print(f"[Matplotlib Draw Error]: {e}")
         
@@ -615,7 +623,8 @@ def get_mmsb_data(sim_id: str):
 
     # 3. Calculer les coordonnées du graphe avec spring_layout
     try:
-        pos = nx.spring_layout(G, k=0.8, seed=42)
+        k_val = 1.5 / np.sqrt(N) if N > 0 else 0.1
+        pos = nx.spring_layout(G, k=k_val, seed=42)
         pos_dict = {k: [float(v[0]), float(v[1])] for k, v in pos.items()}
     except Exception:
         pos_dict = {h.id: [0.0, 0.0] for h in humans}

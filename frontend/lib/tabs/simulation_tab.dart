@@ -72,10 +72,10 @@ class _SimulationTabState extends State<SimulationTab> {
     _loadBubbleImage();
     _loadServerAddress();
     
-    // Polling régulier de l'état du monde
+    // Polling régulier de l'état du monde (avec exclusion dynamique de la grille pour le gain de performance)
     _pollingTimer = Timer.periodic(const Duration(milliseconds: 100), (timer) {
       if (_selectedSimId != null && !_connectionError) {
-        _fetchGameState();
+        _fetchGameState(excludeGrid: _gameState != null);
       }
     });
 
@@ -126,6 +126,17 @@ class _SimulationTabState extends State<SimulationTab> {
   }
 
   String _getCleanHost(String url) {
+    String hostOnly = url.replaceAll('http://', '').replaceAll('https://', '');
+    if (hostOnly.contains(':')) {
+      hostOnly = hostOnly.split(':').first;
+    }
+    bool isDomain = RegExp(r'[a-zA-Z]').hasMatch(hostOnly) && hostOnly.toLowerCase() != 'localhost';
+    if (isDomain) {
+      if (url.endsWith(':5000')) {
+        return url.substring(0, url.length - 5);
+      }
+      return url;
+    }
     String host = url.replaceAll('http://', '').replaceAll('https://', '');
     if (host.contains(':5000')) {
       host = host.replaceAll(':5000', '');
@@ -133,11 +144,61 @@ class _SimulationTabState extends State<SimulationTab> {
     return host;
   }
 
+  String _formatAndValidateUrl(String input) {
+    String text = input.trim();
+    if (text.isEmpty) return ApiClient.baseUrl;
+
+    String scheme = '';
+    if (text.startsWith('http://')) {
+      scheme = 'http://';
+      text = text.substring(7);
+    } else if (text.startsWith('https://')) {
+      scheme = 'https://';
+      text = text.substring(8);
+    } else {
+      String checkHost = text;
+      if (checkHost.contains(':')) {
+        checkHost = checkHost.split(':').first;
+      }
+      bool isDomain = RegExp(r'[a-zA-Z]').hasMatch(checkHost) && checkHost.toLowerCase() != 'localhost';
+      if (isDomain) {
+        scheme = 'https://';
+      } else {
+        scheme = 'http://';
+      }
+    }
+
+    while (text.endsWith('/')) {
+      text = text.substring(0, text.length - 1);
+    }
+
+    // Strip :5000 if it is a domain
+    if (text.endsWith(':5000')) {
+      String hostPart = text.substring(0, text.length - 5);
+      bool isDomain = RegExp(r'[a-zA-Z]').hasMatch(hostPart) && hostPart.toLowerCase() != 'localhost';
+      if (isDomain) {
+        text = hostPart;
+      }
+    }
+
+    if (text.contains(':')) {
+      return '$scheme$text';
+    }
+
+    bool isDomain = RegExp(r'[a-zA-Z]').hasMatch(text) && text.toLowerCase() != 'localhost';
+    if (isDomain) {
+      return '$scheme$text';
+    } else {
+      return '$scheme$text:5000';
+    }
+  }
+
   Future<void> _updateServerAddress(String newUrl) async {
     setState(() {
       ApiClient.baseUrl = newUrl;
       _connectionError = false;
       _gameState = null;
+      _serverController.text = _getCleanHost(newUrl);
     });
     await ClientSettings.setServerAddress(newUrl);
     _fetchSimulations();
@@ -215,16 +276,7 @@ class _SimulationTabState extends State<SimulationTab> {
               onPressed: () {
                 final ip = controller.text.trim();
                 if (ip.isNotEmpty) {
-                  String formatted = ip;
-                  if (!formatted.startsWith('http://') && !formatted.startsWith('https://')) {
-                    formatted = 'http://$formatted';
-                  }
-                  if (!formatted.contains(':5000')) {
-                    if (formatted.endsWith('/')) {
-                      formatted = formatted.substring(0, formatted.length - 1);
-                    }
-                    formatted = '$formatted:5000';
-                  }
+                  final formatted = _formatAndValidateUrl(ip);
                   _updateServerAddress(formatted);
                 }
                 Navigator.of(context).pop();
@@ -399,12 +451,18 @@ class _SimulationTabState extends State<SimulationTab> {
     }
   }
 
-  Future<void> _fetchGameState() async {
-    if (_selectedSimId == null) return;
+  bool _isFetchingState = false;
+
+  Future<void> _fetchGameState({bool excludeGrid = false}) async {
+    if (_selectedSimId == null || _isFetchingState) return;
+    _isFetchingState = true;
     try {
-      final state = await ApiClient.fetchGameState(_selectedSimId!);
+      final state = await ApiClient.fetchGameState(_selectedSimId!, excludeGrid: excludeGrid);
       if (mounted) {
         setState(() {
+          if (excludeGrid && _gameState != null && _gameState!['grille'] != null) {
+            state['grille'] = _gameState!['grille'];
+          }
           _gameState = state;
           _noyadeActive = state['noyade_active'] ?? true;
           
@@ -431,6 +489,8 @@ class _SimulationTabState extends State<SimulationTab> {
           _gameState = null;
         });
       }
+    } finally {
+      _isFetchingState = false;
     }
   }
 
@@ -1558,16 +1618,7 @@ def generer_grille(width, height):
                                             onPressed: () {
                                               final ip = _serverController.text.trim();
                                               if (ip.isNotEmpty) {
-                                                String formatted = ip;
-                                                if (!formatted.startsWith('http://') && !formatted.startsWith('https://')) {
-                                                  formatted = 'http://$formatted';
-                                                }
-                                                if (!formatted.contains(':5000')) {
-                                                  if (formatted.endsWith('/')) {
-                                                    formatted = formatted.substring(0, formatted.length - 1);
-                                                  }
-                                                  formatted = '$formatted:5000';
-                                                }
+                                                final formatted = _formatAndValidateUrl(ip);
                                                 _updateServerAddress(formatted);
                                               }
                                             },
@@ -2843,8 +2894,9 @@ class _InteractiveSocialGraphDialogState extends State<InteractiveSocialGraphDia
           onTapUp: (details) {
             final Offset localPos = details.localPosition;
             String? clickedNodeId;
+            final double hitRadius = _nodes.length > 50 ? (_nodes.length > 120 ? 10.0 : 15.0) : 20.0;
             for (var entry in nodeOffsets.entries) {
-              if ((localPos - entry.value).distance <= 20.0) {
+              if ((localPos - entry.value).distance <= hitRadius) {
                 clickedNodeId = entry.key;
                 break;
               }
@@ -2910,6 +2962,10 @@ class GraphPainter extends CustomPainter {
       }
     }
 
+    final double nodeRadius = nodes.length > 50 ? (nodes.length > 120 ? 6.0 : 9.0) : 12.0;
+    final double outerRadius = nodeRadius + 2.0;
+    final double highlightRadius = outerRadius + 4.0;
+
     for (var node in nodes) {
       final String nId = node['id'];
       if (!nodeOffsets.containsKey(nId)) continue;
@@ -2929,7 +2985,7 @@ class GraphPainter extends CustomPainter {
       if (selectedNodeId == nId) {
         canvas.drawCircle(
           offset,
-          18.0,
+          highlightRadius,
           Paint()
             ..color = Colors.tealAccent
             ..style = PaintingStyle.stroke
@@ -2937,28 +2993,33 @@ class GraphPainter extends CustomPainter {
         );
       }
 
-      canvas.drawCircle(offset, 14.0, Paint()..color = Colors.white);
-      canvas.drawCircle(offset, 12.0, Paint()..color = nodeColor);
+      canvas.drawCircle(offset, outerRadius, Paint()..color = Colors.white);
+      canvas.drawCircle(offset, nodeRadius, Paint()..color = nodeColor);
 
-      final String label = node['label'] ?? '';
-      final TextPainter textPainter = TextPainter(
-        text: TextSpan(
-          text: label,
-          style: const TextStyle(
-            color: Colors.white,
-            fontSize: 8.0,
-            fontWeight: FontWeight.bold,
-            shadows: [
-              Shadow(blurRadius: 4.0, color: Colors.black, offset: Offset(1, 1))
-            ],
+      // Draw label text inside circle only if total nodes <= 120
+      if (nodes.length <= 120) {
+        final double fontSize = nodes.length > 50 ? 6.0 : 8.0;
+        final String label = node['label'] ?? '';
+        final TextPainter textPainter = TextPainter(
+          text: TextSpan(
+            text: label,
+            style: TextStyle(
+              color: Colors.white,
+              fontSize: fontSize,
+              fontWeight: FontWeight.bold,
+              shadows: const [
+                Shadow(blurRadius: 4.0, color: Colors.black, offset: Offset(1, 1))
+              ],
+            ),
           ),
-        ),
-        textDirection: TextDirection.ltr,
-      );
-      textPainter.layout();
-      canvas.translate(offset.dx - textPainter.width / 2, offset.dy - textPainter.height / 2);
-      textPainter.paint(canvas, Offset.zero);
-      canvas.translate(-(offset.dx - textPainter.width / 2), -(offset.dy - textPainter.height / 2));
+          textDirection: TextDirection.ltr,
+        );
+        textPainter.layout();
+        textPainter.paint(
+          canvas,
+          Offset(offset.dx - textPainter.width / 2, offset.dy - textPainter.height / 2),
+        );
+      }
     }
   }
 

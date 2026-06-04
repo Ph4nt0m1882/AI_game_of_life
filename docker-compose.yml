@@ -1,0 +1,22 @@
+version: '3.8'
+
+services:
+  simulation-backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: jormungandr-backend
+    ports:
+      - "5000:5000"
+    volumes:
+      # Synchronise les composants créés ou modifiés par l'application
+      - ./backend/custom_components:/app/custom_components
+    # Injection automatique du fichier .env de la racine dans le conteneur
+    env_file:
+      - .env
+    deploy:
+      resources:
+        limits:
+          cpus: '2.0'
+          memory: 512M
+    restart: unless-stopped

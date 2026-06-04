@@ -26,9 +26,9 @@ class ApiClient {
     throw Exception('Impossible de créer une nouvelle simulation');
   }
 
-  /// Récupère l'état actuel d'une simulation
-  static Future<Map<String, dynamic>> fetchGameState(String simId) async {
-    final response = await http.get(Uri.parse('$baseUrl/api/simulations/$simId/state'));
+  /// Récupère l'état actuel d'une simulation (avec option d'exclure la grille)
+  static Future<Map<String, dynamic>> fetchGameState(String simId, {bool excludeGrid = false}) async {
+    final response = await http.get(Uri.parse('$baseUrl/api/simulations/$simId/state?exclude_grid=$excludeGrid'));
     if (response.statusCode == 200) {
       return json.decode(response.body) as Map<String, dynamic>;
     }
