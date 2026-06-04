@@ -3,7 +3,7 @@ import 'dart:typed_data';
 import 'package:http/http.dart' as http;
 
 class ApiClient {
-  static const String baseUrl = 'http://127.0.0.1:5000';
+  static String baseUrl = 'http://127.0.0.1:5000';
 
   /// Récupère la liste de toutes les simulations
   static Future<List<dynamic>> fetchSimulations() async {
@@ -14,9 +14,11 @@ class ApiClient {
     throw Exception('Impossible de récupérer la liste des simulations');
   }
 
-  /// Crée une nouvelle simulation
-  static Future<String> createSimulation() async {
-    final response = await http.post(Uri.parse('$baseUrl/api/simulations'));
+  /// Crée une nouvelle simulation avec une taille personnalisée
+  static Future<String> createSimulation({int width = 80, int height = 80}) async {
+    final response = await http.post(
+      Uri.parse('$baseUrl/api/simulations?width=$width&height=$height'),
+    );
     if (response.statusCode == 200) {
       final data = json.decode(response.body);
       return data['sim_id'] as String;
@@ -220,6 +222,20 @@ class ApiClient {
         "noyade_active": noyadeActive,
         "speed_factor": speedFactor,
         "gemini_api_key": geminiApiKey ?? "",
+      }),
+    );
+    return response.statusCode == 200;
+  }
+
+  /// Met à jour une statistique d'un composant en mode debug
+  static Future<bool> updateComponentStat(String simId, String compId, String key, dynamic value) async {
+    final response = await http.put(
+      Uri.parse('$baseUrl/api/simulations/$simId/components/stats'),
+      headers: {"Content-Type": "application/json"},
+      body: json.encode({
+        "comp_id": compId,
+        "key": key,
+        "value": value,
       }),
     );
     return response.statusCode == 200;

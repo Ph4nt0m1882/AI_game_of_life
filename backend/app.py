@@ -81,11 +81,10 @@ async def startup_event():
     asyncio.create_task(simulation_loop())
 
 @app.post("/api/simulations")
-def create_new_sim():
+def create_new_sim(width: int = 80, height: int = 80):
     sim_id = str(uuid.uuid4())[:8] # Un petit ID lisible
-    # On augmente la taille par défaut pour éviter le blocage trop rapide (ex: 80x80)
     simulations[sim_id] = {
-        "sim": Simulation(width=80, height=80),
+        "sim": Simulation(width=width, height=height),
         "is_running": False,
         "speed_factor": 1.0,
         "accumulated_time": 0.0
@@ -394,6 +393,257 @@ def update_simulation_settings(sim_id: str, req: SimulationSettingsRequest):
             sim.generer_ile("circular")
             
     return {"status": "success", "noyade_active": sim.noyade_active, "speed_factor": req.speed_factor}
+
+class UpdateComponentStatRequest(BaseModel):
+    comp_id: str
+    key: str
+    value: Any
+
+def update_component_stat(sim, comp, key, value):
+    key_lower = key.lower()
+    if "sexe" in key_lower:
+        comp.sexe = str(value)
+    elif "énergie" in key_lower or "energie" in key_lower:
+        comp.energie = int(float(value))
+    elif "libido" in key_lower:
+        comp.libido = int(float(value))
+    elif "colère" in key_lower or "colere" in key_lower:
+        comp.colere = int(float(value))
+    elif "intention" in key_lower:
+        comp.intention = str(value)
+    elif "vitesse atb" in key_lower:
+        comp.atb_vitesse = int(float(value))
+    elif "atb accumulé" in key_lower or "atb accumule" in key_lower:
+        comp.atb_actuel = int(float(value))
+    elif "activité" in key_lower or "activite" in key_lower:
+        comp.dernier_etat = str(value)
+    elif "position" in key_lower:
+        import re
+        m = re.search(r'(\d+)\s*,\s*(\d+)', str(value))
+        if m:
+            nx, ny = int(m.group(1)), int(m.group(2))
+            if 0 <= nx < sim.width and 0 <= ny < sim.height:
+                if sim.get_composant_at(nx, ny) is None:
+                    sim.grille_entites.pop((comp.x, comp.y), None)
+                    comp.x = nx
+                    comp.y = ny
+                    sim.grille_entites[(nx, ny)] = comp
+    elif "relation (" in key_lower:
+        import re
+        m = re.search(r'relation\s*\(([^)]+)\)', key_lower)
+        if m:
+            short_id = m.group(1)
+            target_id = None
+            for c_id in sim.composants.keys():
+                if c_id.startswith(short_id):
+                    target_id = c_id
+                    break
+            if target_id:
+                val_m = re.search(r'(\d+)', str(value))
+                if val_m:
+                    score = int(val_m.group(1))
+                    comp.relations[target_id] = max(0, min(100, score))
+    else:
+        # Fallback attribute setting by reflection
+        attr_name = key.replace(" ", "_").lower()
+        if hasattr(comp, attr_name):
+            curr_val = getattr(comp, attr_name)
+            try:
+                if isinstance(curr_val, bool):
+                    setattr(comp, attr_name, str(value).lower() in ("true", "1", "yes"))
+                elif isinstance(curr_val, int):
+                    setattr(comp, attr_name, int(float(value)))
+                elif isinstance(curr_val, float):
+                    setattr(comp, attr_name, float(value))
+                else:
+                    setattr(comp, attr_name, str(value))
+            except Exception:
+                pass
+
+@app.put("/api/simulations/{sim_id}/components/stats")
+def update_component_stats(sim_id: str, req: UpdateComponentStatRequest):
+    if sim_id not in simulations:
+        raise HTTPException(status_code=404, detail="Simulation non trouvée")
+    sim = simulations[sim_id]["sim"]
+    
+    comp = sim.composants.get(req.comp_id)
+    if not comp:
+        raise HTTPException(status_code=404, detail="Composant non trouvé")
+        
+    try:
+        update_component_stat(sim, comp, req.key, req.value)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Erreur d'écriture : {str(e)}")
+        
+    return {"status": "success", "component": comp.to_dict()}
+
+@app.get("/api/simulations/{sim_id}/mmsb/plot")
+def get_mmsb_plot(sim_id: str):
+    import matplotlib
+    matplotlib.use('Agg')
+    import matplotlib.pyplot as plt
+    import networkx as nx
+    import io
+    import numpy as np
+    from fastapi.responses import StreamingResponse
+    from mmsb import MMSB
+
+    if sim_id not in simulations:
+        raise HTTPException(status_code=404, detail="Simulation non trouvée")
+    
+    sim = simulations[sim_id]["sim"]
+    
+    # 1. Récupérer les humains vivants
+    humans = [c for c in sim.composants.values() if "humain" in c.type_id.lower() and c.vivant]
+    
+    # Créer une image vide par défaut s'il n'y a pas assez d'humains
+    if len(humans) < 2:
+        fig, ax = plt.subplots(figsize=(6, 4), facecolor='none')
+        ax.set_facecolor('none')
+        ax.text(0.5, 0.5, "Pas assez d'humains vivants\npour générer le graphe social.", 
+                ha='center', va='center', color='gray', fontsize=12)
+        ax.axis('off')
+        
+        buf = io.BytesIO()
+        plt.savefig(buf, format='png', bbox_inches='tight', transparent=True, dpi=100)
+        plt.close(fig)
+        buf.seek(0)
+        return StreamingResponse(buf, media_type="image/png")
+
+    # 2. Construire le graphe NetworkX
+    G = nx.Graph()
+    labels = {}
+    for h in humans:
+        h_id = h.id
+        sexe = getattr(h, "sexe", "?")
+        short_name = f"{sexe}-{h_id[:4]}"
+        labels[h_id] = short_name
+        G.add_node(h_id, label=short_name)
+
+    for h in humans:
+        h_id = h.id
+        relations = getattr(h, "relations", {})
+        for other_id, score in relations.items():
+            if other_id in labels and score > 50:
+                G.add_edge(h_id, other_id)
+
+    N = G.number_of_nodes()
+    A = nx.to_numpy_array(G)
+
+    # 3. Fit MMSB model
+    K = 2
+    mmsb = MMSB(G, K=K, alpha=0.5, eta=0.05)
+    mmsb.fit(A, max_iter=50, tol=1e-4)
+    memberships = mmsb.get_memberships()
+
+    # 4. Coloration des nœuds en dégradé de Rouge (Groupe 0) à Bleu (Groupe 1)
+    node_colors = []
+    for i in range(N):
+        r = float(memberships[i, 0])
+        b = float(memberships[i, 1])
+        node_colors.append((r, 0.1, b))
+
+    # 5. Générer le tracé Matplotlib
+    fig, ax = plt.subplots(figsize=(6, 5), facecolor='none')
+    ax.set_facecolor('none')
+    
+    try:
+        # Layout spring élastique pour le graphe
+        pos = nx.spring_layout(G, k=0.8, seed=42)
+        
+        # Dessiner les liens (edges) en blanc transparent
+        nx.draw_networkx_edges(G, pos, ax=ax, edge_color='#ffffff', alpha=0.3, width=1.5)
+        
+        # Dessiner les nœuds (nodes)
+        nx.draw_networkx_nodes(G, pos, ax=ax, node_color=node_colors, node_size=800, alpha=0.9, edgecolors='#ffffff')
+        
+        # Dessiner les étiquettes (labels)
+        nx.draw_networkx_labels(G, pos, labels, ax=ax, font_size=8, font_color='white', font_weight='bold')
+    except Exception as e:
+        print(f"[Matplotlib Draw Error]: {e}")
+        
+    ax.axis('off')
+    
+    # 6. Sauvegarder dans un buffer et renvoyer
+    buf = io.BytesIO()
+    plt.savefig(buf, format='png', bbox_inches='tight', transparent=True, dpi=120)
+    plt.close(fig)
+    buf.seek(0)
+    
+    return StreamingResponse(buf, media_type="image/png")
+
+@app.get("/api/simulations/{sim_id}/mmsb/data")
+def get_mmsb_data(sim_id: str):
+    import networkx as nx
+    import numpy as np
+    from mmsb import MMSB
+
+    if sim_id not in simulations:
+        raise HTTPException(status_code=404, detail="Simulation non trouvée")
+    
+    sim = simulations[sim_id]["sim"]
+    humans = [c for c in sim.composants.values() if "humain" in c.type_id.lower() and c.vivant]
+    
+    if len(humans) < 2:
+        return {"nodes": [], "links": []}
+
+    # 1. Construire le graphe NetworkX
+    G = nx.Graph()
+    labels = {}
+    for h in humans:
+        h_id = h.id
+        sexe = getattr(h, "sexe", "?")
+        short_name = f"{sexe}-{h_id[:4]}"
+        labels[h_id] = short_name
+        G.add_node(h_id, label=short_name)
+
+    for h in humans:
+        h_id = h.id
+        relations = getattr(h, "relations", {})
+        for other_id, score in relations.items():
+            if other_id in labels and score > 50:
+                G.add_edge(h_id, other_id)
+
+    N = G.number_of_nodes()
+    A = nx.to_numpy_array(G)
+
+    # 2. Fit MMSB
+    K = 2
+    mmsb = MMSB(G, K=K, alpha=0.5, eta=0.05)
+    mmsb.fit(A, max_iter=50, tol=1e-4)
+    memberships = mmsb.get_memberships()
+
+    # 3. Calculer les coordonnées du graphe avec spring_layout
+    try:
+        pos = nx.spring_layout(G, k=0.8, seed=42)
+        pos_dict = {k: [float(v[0]), float(v[1])] for k, v in pos.items()}
+    except Exception:
+        pos_dict = {h.id: [0.0, 0.0] for h in humans}
+
+    # 4. Construire la liste des nœuds
+    nodes_data = []
+    node_ids = list(G.nodes)
+    for i, n_id in enumerate(node_ids):
+        nodes_data.append({
+            "id": n_id,
+            "label": labels[n_id],
+            "x": pos_dict[n_id][0],
+            "y": pos_dict[n_id][1],
+            "membership": [float(memberships[i, 0]), float(memberships[i, 1])]
+        })
+
+    # 5. Construire la liste des liens
+    links_data = []
+    for u, v in G.edges:
+        links_data.append({
+            "source": u,
+            "target": v
+        })
+
+    return {
+        "nodes": nodes_data,
+        "links": links_data
+    }
 
 if __name__ == "__main__":
     uvicorn.run("app:app", host="0.0.0.0", port=5000)

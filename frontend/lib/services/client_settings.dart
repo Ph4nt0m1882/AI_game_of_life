@@ -76,6 +76,50 @@ class ClientSettings {
     return _geminiApiKey ?? '';
   }
 
+  static String? _serverAddress;
+
+  /// Récupère l'adresse du serveur.
+  static Future<String> getServerAddress() async {
+    if (kIsWeb) {
+      return 'http://127.0.0.1:5000';
+    }
+    if (_serverAddress != null) {
+      return _serverAddress!;
+    }
+    try {
+      final file = io.File('client_settings.json');
+      if (await file.exists()) {
+        final content = await file.readAsString();
+        final data = json.decode(content);
+        _serverAddress = data['server_address'] as String?;
+      }
+    } catch (e) {
+      // Ignorer
+    }
+    if (_serverAddress == null || _serverAddress!.isEmpty) {
+      _serverAddress = 'http://127.0.0.1:5000';
+    }
+    return _serverAddress!;
+  }
+
+  /// Enregistre l'adresse du serveur.
+  static Future<void> setServerAddress(String address) async {
+    if (kIsWeb) return;
+    _serverAddress = address;
+    try {
+      final file = io.File('client_settings.json');
+      Map<String, dynamic> data = {};
+      if (await file.exists()) {
+        final content = await file.readAsString();
+        data = Map<String, dynamic>.from(json.decode(content));
+      }
+      data['server_address'] = address;
+      await file.writeAsString(json.encode(data));
+    } catch (e) {
+      // Ignorer
+    }
+  }
+
   /// Enregistre la clé API Gemini.
   static Future<void> setGeminiApiKey(String apiKey) async {
     if (kIsWeb) {

@@ -1,3 +1,4 @@
+import 'dart:math' as math;
 import 'dart:ui' as ui;
 import 'package:flutter/material.dart';
 
@@ -26,6 +27,22 @@ class InteractiveIslandPainterWidget extends StatefulWidget {
 class _InteractiveIslandPainterWidgetState extends State<InteractiveIslandPainterWidget> {
   int _lastPaintedX = -1;
   int _lastPaintedY = -1;
+  late TransformationController _transformationController;
+  bool _initialized = false;
+  double _lastWidth = 0.0;
+  double _lastHeight = 0.0;
+
+  @override
+  void initState() {
+    super.initState();
+    _transformationController = TransformationController();
+  }
+
+  @override
+  void dispose() {
+    _transformationController.dispose();
+    super.dispose();
+  }
 
   void _handleGesture(Offset localPosition, bool isDrag) {
     final int width = widget.gameState['width'] ?? 80;
@@ -62,49 +79,87 @@ class _InteractiveIslandPainterWidgetState extends State<InteractiveIslandPainte
 
     final bool isPainting = widget.activeTool == 'paint_land' || widget.activeTool == 'paint_water';
 
-    return Center(
-      child: InteractiveViewer(
-        constrained: false,
-        minScale: 0.1,
-        maxScale: 5.0,
-        boundaryMargin: const EdgeInsets.all(1000),
-        child: Container(
-          width: canvasWidth,
-          height: canvasHeight,
-          decoration: BoxDecoration(
-            border: Border.all(color: const Color(0xFF0A3E85), width: 2),
-            color: const Color(0xFF0D47A1),
-          ),
-          child: GestureDetector(
-            onTapDown: (details) {
-              _handleGesture(details.localPosition, false);
-            },
-            onPanStart: isPainting
-                ? (details) {
-                    _lastPaintedX = -1;
-                    _lastPaintedY = -1;
-                    _handleGesture(details.localPosition, true);
-                  }
-                : null,
-            onPanUpdate: isPainting
-                ? (details) {
-                    _handleGesture(details.localPosition, true);
-                  }
-                : null,
-            child: CustomPaint(
-              size: Size(canvasWidth, canvasHeight),
-              painter: IslandPainter(
-                gameState: widget.gameState,
-                iconCache: widget.iconCache,
-                cellSize: cellSize,
-                bubbleImage: widget.bubbleImage,
+    return ExcludeSemantics(
+      child: Center(
+        child: LayoutBuilder(
+        builder: (context, constraints) {
+          final double viewportWidth = constraints.maxWidth;
+          final double viewportHeight = constraints.maxHeight;
+
+          // Si pas encore initialisé ou si la taille du viewport a changé (ex: redimensionnement de fenêtre)
+          if (!_initialized || viewportWidth != _lastWidth || viewportHeight != _lastHeight) {
+            _lastWidth = viewportWidth;
+            _lastHeight = viewportHeight;
+            _initialized = true;
+
+            // Calcul de l'échelle pour rentrer tout le canevas
+            final double scaleX = viewportWidth / canvasWidth;
+            final double scaleY = viewportHeight / canvasHeight;
+            final double scale = math.min(scaleX, scaleY);
+
+            // Centrage horizontal et vertical
+            final double dx = (viewportWidth - canvasWidth * scale) / 2;
+            final double dy = (viewportHeight - canvasHeight * scale) / 2;
+
+            final targetValue = Matrix4.identity();
+            targetValue.setEntry(0, 0, scale);
+            targetValue.setEntry(1, 1, scale);
+            targetValue.setEntry(0, 3, dx);
+            targetValue.setEntry(1, 3, dy);
+
+            WidgetsBinding.instance.addPostFrameCallback((_) {
+              if (mounted) {
+                _transformationController.value = targetValue;
+              }
+            });
+          }
+
+          return InteractiveViewer(
+            transformationController: _transformationController,
+            constrained: false,
+            minScale: 0.05, // Permet de dézoomer davantage pour les mondes géants
+            maxScale: 5.0,
+            boundaryMargin: const EdgeInsets.all(1000),
+            child: Container(
+              width: canvasWidth,
+              height: canvasHeight,
+              decoration: BoxDecoration(
+                border: Border.all(color: const Color(0xFF0A3E85), width: 2),
+                color: const Color(0xFF0D47A1),
+              ),
+              child: GestureDetector(
+                onTapDown: (details) {
+                  _handleGesture(details.localPosition, false);
+                },
+                onPanStart: isPainting
+                    ? (details) {
+                        _lastPaintedX = -1;
+                        _lastPaintedY = -1;
+                        _handleGesture(details.localPosition, true);
+                      }
+                    : null,
+                onPanUpdate: isPainting
+                    ? (details) {
+                        _handleGesture(details.localPosition, true);
+                      }
+                    : null,
+                child: CustomPaint(
+                  size: Size(canvasWidth, canvasHeight),
+                  painter: IslandPainter(
+                    gameState: widget.gameState,
+                    iconCache: widget.iconCache,
+                    cellSize: cellSize,
+                    bubbleImage: widget.bubbleImage,
+                  ),
+                ),
               ),
             ),
-          ),
-        ),
+          );
+        },
       ),
-    );
-  }
+    ),
+  );
+}
 }
 
 class IslandPainter extends CustomPainter {

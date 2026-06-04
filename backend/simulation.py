@@ -17,6 +17,8 @@ class Simulation:
         self.grille_entites = {} # (x, y) -> composant
         self.gemini_api_key = os.getenv("API_KEY", "")
         self.dialogues = []
+        self.total_naissances = 0
+        self.total_deces = 0
         
         self.generer_ile("circular")
         self.generer_cellules_initiales()
@@ -189,6 +191,8 @@ class Simulation:
         if not self.get_composant_at(composant.x, composant.y):
             self.composants[composant.id] = composant
             self.grille_entites[(composant.x, composant.y)] = composant
+            if self.scheduler.tick_count > 0:
+                self.total_naissances = getattr(self, "total_naissances", 0) + 1
             return True
         return False
 
@@ -196,6 +200,7 @@ class Simulation:
         comp = self.get_composant_at(x, y)
         if comp:
             comp.vivant = False
+            self.total_deces = getattr(self, "total_deces", 0) + 1
             if comp.id in self.composants:
                 del self.composants[comp.id]
             if (x, y) in self.grille_entites:
@@ -230,6 +235,7 @@ class Simulation:
     def nettoyer_morts(self):
         morts = [c for c in self.composants.values() if not c.vivant]
         for c in morts:
+            self.total_deces = getattr(self, "total_deces", 0) + 1
             del self.composants[c.id]
             if self.grille_entites.get((c.x, c.y)) == c:
                 del self.grille_entites[(c.x, c.y)]
@@ -264,6 +270,9 @@ class Simulation:
         
         return {
             "Total d'Entités": len(self.composants),
+            "Naissances": getattr(self, "total_naissances", 0),
+            "Décès": getattr(self, "total_deces", 0),
+            "Meurtres": getattr(self, "total_meurtres", 0),
             "Répartition": type_counts,
             "Terre": f"{land_cells} cases ({land_cells/total_cells*100:.1f}%)",
             "Eau": f"{water_cells} cases ({water_cells/total_cells*100:.1f}%)",

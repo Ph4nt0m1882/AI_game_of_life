@@ -40,6 +40,9 @@ class _SimulationTabState extends State<SimulationTab> {
   String? _selectedStatsComponentId;
   Map<String, dynamic>? _cachedComponentStats;
   bool _selectedComponentAlive = true;
+  bool _debugMode = false;
+  bool _connectionError = false;
+  final TextEditingController _serverController = TextEditingController();
 
   final Map<String, ui.Image> _iconCache = {};
   ui.Image? _bubbleImage;
@@ -67,20 +70,21 @@ class _SimulationTabState extends State<SimulationTab> {
     super.initState();
     _loadGeminiApiKey();
     _loadBubbleImage();
-    _fetchSimulations();
-    _fetchComponents();
+    _loadServerAddress();
     
     // Polling régulier de l'état du monde
     _pollingTimer = Timer.periodic(const Duration(milliseconds: 100), (timer) {
-      if (_selectedSimId != null) {
+      if (_selectedSimId != null && !_connectionError) {
         _fetchGameState();
       }
     });
 
     // Polling des mondes et des composants disponibles
     _listTimer = Timer.periodic(const Duration(seconds: 3), (timer) {
-      _fetchSimulations();
-      _fetchComponents();
+      if (!_connectionError) {
+        _fetchSimulations();
+        _fetchComponents();
+      }
     });
   }
 
@@ -88,6 +92,7 @@ class _SimulationTabState extends State<SimulationTab> {
   void dispose() {
     _pollingTimer?.cancel();
     _listTimer?.cancel();
+    _serverController.dispose();
     super.dispose();
   }
 
@@ -110,6 +115,128 @@ class _SimulationTabState extends State<SimulationTab> {
     } catch (_) {}
   }
 
+  Future<void> _loadServerAddress() async {
+    try {
+      final savedAddress = await ClientSettings.getServerAddress();
+      ApiClient.baseUrl = savedAddress;
+      _serverController.text = _getCleanHost(savedAddress);
+      _fetchSimulations();
+      _fetchComponents();
+    } catch (_) {}
+  }
+
+  String _getCleanHost(String url) {
+    String host = url.replaceAll('http://', '').replaceAll('https://', '');
+    if (host.contains(':5000')) {
+      host = host.replaceAll(':5000', '');
+    }
+    return host;
+  }
+
+  Future<void> _updateServerAddress(String newUrl) async {
+    setState(() {
+      ApiClient.baseUrl = newUrl;
+      _connectionError = false;
+      _gameState = null;
+    });
+    await ClientSettings.setServerAddress(newUrl);
+    _fetchSimulations();
+    _fetchComponents();
+  }
+
+  Future<void> _showServerAddressConfigDialog() async {
+    final controller = TextEditingController(text: _getCleanHost(ApiClient.baseUrl));
+
+    await showDialog(
+      context: context,
+      builder: (context) {
+        return AlertDialog(
+          backgroundColor: const Color(0xFF1E1E24),
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+          title: const Row(
+            children: [
+              Icon(Icons.settings_ethernet, color: Color(0xFF00F0FF)),
+              SizedBox(width: 8),
+              Text(
+                'Adresse du Serveur',
+                style: TextStyle(
+                  color: Colors.white,
+                  fontFamily: 'Trebuchet MS',
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+            ],
+          ),
+          content: SizedBox(
+            width: 320,
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.stretch,
+              children: [
+                const Text(
+                  'Saisissez l\'adresse IP ou le nom d\'hôte du serveur Python (le port 5000 sera configuré automatiquement).',
+                  style: TextStyle(color: Color(0xFFC8C8D2), fontSize: 13),
+                ),
+                const SizedBox(height: 20),
+                TextField(
+                  controller: controller,
+                  style: const TextStyle(color: Colors.white),
+                  decoration: const InputDecoration(
+                    labelText: 'Adresse IP / Hôte',
+                    labelStyle: TextStyle(color: Color(0xFF00F0FF)),
+                    hintText: 'ex: 192.168.1.50 ou 127.0.0.1',
+                    enabledBorder: UnderlineInputBorder(
+                      borderSide: BorderSide(color: Colors.grey),
+                    ),
+                    focusedBorder: UnderlineInputBorder(
+                      borderSide: BorderSide(color: Color(0xFF00F0FF)),
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 12),
+                Text(
+                  'Adresse actuelle : ${ApiClient.baseUrl}',
+                  style: const TextStyle(color: Colors.grey, fontSize: 11),
+                ),
+              ],
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(context).pop(),
+              child: const Text('Annuler', style: TextStyle(color: Colors.grey)),
+            ),
+            ElevatedButton(
+              style: ElevatedButton.styleFrom(
+                backgroundColor: const Color(0xFF00F0FF),
+                foregroundColor: Colors.black,
+                shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+              ),
+              onPressed: () {
+                final ip = controller.text.trim();
+                if (ip.isNotEmpty) {
+                  String formatted = ip;
+                  if (!formatted.startsWith('http://') && !formatted.startsWith('https://')) {
+                    formatted = 'http://$formatted';
+                  }
+                  if (!formatted.contains(':5000')) {
+                    if (formatted.endsWith('/')) {
+                      formatted = formatted.substring(0, formatted.length - 1);
+                    }
+                    formatted = '$formatted:5000';
+                  }
+                  _updateServerAddress(formatted);
+                }
+                Navigator.of(context).pop();
+              },
+              child: const Text('Valider', style: TextStyle(fontWeight: FontWeight.bold)),
+            ),
+          ],
+        );
+      },
+    );
+  }
+
   Future<void> _loadBubbleImage() async {
     try {
       final data = await rootBundle.load('assets/bubble.png');
@@ -129,29 +256,38 @@ class _SimulationTabState extends State<SimulationTab> {
   Future<void> _fetchSimulations() async {
     try {
       final fetchedSims = await ApiClient.fetchSimulations();
-      setState(() {
-        _simulations = fetchedSims;
-        
-        final exists = _simulations.any((s) => s['id'] == _selectedSimId);
-        if (!exists) {
-          _selectedSimId = null;
-          _uploadedCustomComponentIds.clear();
-        }
-        
-        if (_selectedSimId == null && _simulations.isNotEmpty) {
-          _selectedSimId = _simulations.first['id'];
-          _isRunning = _simulations.first['is_running'];
-        }
-
-        if (_selectedSimId != null) {
-          final activeSim = _simulations.firstWhere((s) => s['id'] == _selectedSimId, orElse: () => null);
-          if (activeSim != null) {
-            _speedFactor = (activeSim['speed_factor'] ?? 1.0).toDouble();
+      if (mounted) {
+        setState(() {
+          _connectionError = false;
+          _simulations = fetchedSims;
+          
+          final exists = _simulations.any((s) => s['id'] == _selectedSimId);
+          if (!exists) {
+            _selectedSimId = null;
+            _uploadedCustomComponentIds.clear();
           }
-        }
-      });
+          
+          if (_selectedSimId == null && _simulations.isNotEmpty) {
+            _selectedSimId = _simulations.first['id'];
+            _isRunning = _simulations.first['is_running'];
+          }
+
+          if (_selectedSimId != null) {
+            final activeSim = _simulations.firstWhere((s) => s['id'] == _selectedSimId, orElse: () => null);
+            if (activeSim != null) {
+              _speedFactor = (activeSim['speed_factor'] ?? 1.0).toDouble();
+            }
+          }
+        });
+      }
     } catch (e) {
-      // Ignorer les erreurs de connexion réseau temporaires
+      if (mounted) {
+        setState(() {
+          _connectionError = true;
+          _simulations = [];
+          _selectedSimId = null;
+        });
+      }
     }
   }
 
@@ -288,13 +424,19 @@ class _SimulationTabState extends State<SimulationTab> {
         });
       }
     } catch (e) {
-      // Ignorer
+      if (mounted) {
+        setState(() {
+          _connectionError = true;
+          _selectedSimId = null;
+          _gameState = null;
+        });
+      }
     }
   }
 
-  Future<void> _createNewSim() async {
+  Future<void> _createNewSim({int width = 80, int height = 80}) async {
     try {
-      final simId = await ApiClient.createSimulation();
+      final simId = await ApiClient.createSimulation(width: width, height: height);
       setState(() {
         _selectedSimId = simId;
         _isRunning = false;
@@ -304,6 +446,125 @@ class _SimulationTabState extends State<SimulationTab> {
     } catch (e) {
       // Ignorer
     }
+  }
+
+  Future<void> _showCreateWorldDialog() async {
+    int width = 80;
+    int height = 80;
+
+    await showDialog(
+      context: context,
+      builder: (context) {
+        return StatefulBuilder(
+          builder: (context, setDialogState) {
+            return AlertDialog(
+              backgroundColor: const Color(0xFF1E1E24),
+              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+              title: const Row(
+                children: [
+                  Icon(Icons.public, color: Color(0xFF00F0FF)),
+                  SizedBox(width: 8),
+                  Text(
+                    'Créer un Monde',
+                    style: TextStyle(
+                      color: Colors.white,
+                      fontFamily: 'Trebuchet MS',
+                      fontWeight: FontWeight.bold,
+                    ),
+                  ),
+                ],
+              ),
+              content: SizedBox(
+                width: 300,
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  children: [
+                    const Text(
+                      'Choisissez la taille de la grille (lignes et colonnes) pour votre simulation.',
+                      style: TextStyle(color: Color(0xFFC8C8D2), fontSize: 13),
+                    ),
+                    const SizedBox(height: 24),
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      children: [
+                        const Text('Largeur :', style: TextStyle(color: Colors.white, fontSize: 13)),
+                        Text(
+                          '$width',
+                          style: const TextStyle(
+                            color: Color(0xFF00F0FF),
+                            fontWeight: FontWeight.bold,
+                            fontSize: 14,
+                          ),
+                        ),
+                      ],
+                    ),
+                    Slider(
+                      value: width.toDouble(),
+                      min: 30,
+                      max: 200,
+                      divisions: 17, // Pas de 10
+                      activeColor: const Color(0xFF00F0FF),
+                      inactiveColor: Colors.grey[800],
+                      onChanged: (val) {
+                        setDialogState(() {
+                          width = val.round();
+                        });
+                      },
+                    ),
+                    const SizedBox(height: 12),
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      children: [
+                        const Text('Hauteur :', style: TextStyle(color: Colors.white, fontSize: 13)),
+                        Text(
+                          '$height',
+                          style: const TextStyle(
+                            color: Color(0xFF00F0FF),
+                            fontWeight: FontWeight.bold,
+                            fontSize: 14,
+                          ),
+                        ),
+                      ],
+                    ),
+                    Slider(
+                      value: height.toDouble(),
+                      min: 30,
+                      max: 200,
+                      divisions: 17, // Pas de 10
+                      activeColor: const Color(0xFF00F0FF),
+                      inactiveColor: Colors.grey[800],
+                      onChanged: (val) {
+                        setDialogState(() {
+                          height = val.round();
+                        });
+                      },
+                    ),
+                  ],
+                ),
+              ),
+              actions: [
+                TextButton(
+                  onPressed: () => Navigator.of(context).pop(),
+                  child: const Text('Annuler', style: TextStyle(color: Colors.grey)),
+                ),
+                ElevatedButton(
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: const Color(0xFF00F0FF),
+                    foregroundColor: Colors.black,
+                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                  ),
+                  onPressed: () {
+                    Navigator.of(context).pop();
+                    _createNewSim(width: width, height: height);
+                  },
+                  child: const Text('Créer', style: TextStyle(fontWeight: FontWeight.bold)),
+                ),
+              ],
+            );
+          },
+        );
+      },
+    );
   }
 
   Future<void> _toggleSim(bool start) async {
@@ -847,7 +1108,13 @@ def generer_grille(width, height):
                         IconButton.filledTonal(
                           icon: const Icon(Icons.add),
                           tooltip: 'Créer un nouveau monde',
-                          onPressed: _createNewSim,
+                          onPressed: _showCreateWorldDialog,
+                        ),
+                        const SizedBox(width: 8),
+                        IconButton.filledTonal(
+                          icon: const Icon(Icons.settings_ethernet),
+                          tooltip: 'Adresse du serveur distant',
+                          onPressed: _showServerAddressConfigDialog,
                         )
                       ],
                     ),
@@ -1219,33 +1486,129 @@ def generer_grille(width, height):
                       ),
                     ),
                     padding: const EdgeInsets.all(16.0),
-                    child: _gameState == null
-                        ? const Center(
-                            child: Text(
-                              "Sélectionnez ou créez un monde pour démarrer la simulation",
-                              style: TextStyle(
-                                color: Colors.white,
-                                fontSize: 16,
-                                fontWeight: FontWeight.bold,
-                                shadows: [
-                                  Shadow(
-                                    offset: Offset(1.0, 1.0),
-                                    blurRadius: 4.0,
-                                    color: Colors.black,
+                    child: _connectionError
+                        ? Center(
+                            child: Card(
+                              color: const Color(0xFF1E1E24),
+                              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+                              child: Padding(
+                                padding: const EdgeInsets.all(24.0),
+                                child: SizedBox(
+                                  width: 380,
+                                  child: Column(
+                                    mainAxisSize: MainAxisSize.min,
+                                    children: [
+                                      const Row(
+                                        mainAxisAlignment: MainAxisAlignment.center,
+                                        children: [
+                                          Icon(Icons.wifi_off, color: Colors.red, size: 28),
+                                          SizedBox(width: 8),
+                                          Text(
+                                            'Serveur Injoignable',
+                                            style: TextStyle(
+                                              color: Colors.white,
+                                              fontSize: 18,
+                                              fontWeight: FontWeight.bold,
+                                              fontFamily: 'Trebuchet MS',
+                                            ),
+                                          ),
+                                        ],
+                                      ),
+                                      const SizedBox(height: 12),
+                                      Text(
+                                        'Impossible de se connecter au serveur Python sur\n${ApiClient.baseUrl}',
+                                        textAlign: TextAlign.center,
+                                        style: const TextStyle(color: Color(0xFFC8C8D2), fontSize: 13),
+                                      ),
+                                      const SizedBox(height: 24),
+                                      TextField(
+                                        controller: _serverController,
+                                        style: const TextStyle(color: Colors.white),
+                                        decoration: InputDecoration(
+                                          labelText: 'Adresse IP du serveur distant',
+                                          labelStyle: const TextStyle(color: Color(0xFF00F0FF)),
+                                          hintText: 'ex: 192.168.1.50',
+                                          hintStyle: TextStyle(color: Colors.grey[700]),
+                                          enabledBorder: OutlineInputBorder(
+                                            borderSide: const BorderSide(color: Colors.grey),
+                                            borderRadius: BorderRadius.circular(8),
+                                          ),
+                                          focusedBorder: OutlineInputBorder(
+                                            borderSide: const BorderSide(color: Color(0xFF00F0FF)),
+                                            borderRadius: BorderRadius.circular(8),
+                                          ),
+                                        ),
+                                      ),
+                                      const SizedBox(height: 20),
+                                      Row(
+                                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                                        children: [
+                                          TextButton(
+                                            onPressed: () {
+                                              _updateServerAddress('http://127.0.0.1:5000');
+                                            },
+                                            child: const Text('Rétablir Localhost', style: TextStyle(color: Colors.grey)),
+                                          ),
+                                          ElevatedButton(
+                                            style: ElevatedButton.styleFrom(
+                                              backgroundColor: const Color(0xFF00F0FF),
+                                              foregroundColor: Colors.black,
+                                              shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(8)),
+                                            ),
+                                            onPressed: () {
+                                              final ip = _serverController.text.trim();
+                                              if (ip.isNotEmpty) {
+                                                String formatted = ip;
+                                                if (!formatted.startsWith('http://') && !formatted.startsWith('https://')) {
+                                                  formatted = 'http://$formatted';
+                                                }
+                                                if (!formatted.contains(':5000')) {
+                                                  if (formatted.endsWith('/')) {
+                                                    formatted = formatted.substring(0, formatted.length - 1);
+                                                  }
+                                                  formatted = '$formatted:5000';
+                                                }
+                                                _updateServerAddress(formatted);
+                                              }
+                                            },
+                                            child: const Text('Se connecter', style: TextStyle(fontWeight: FontWeight.bold)),
+                                          ),
+                                        ],
+                                      ),
+                                    ],
                                   ),
-                                ],
+                                ),
                               ),
-                              textAlign: TextAlign.center,
                             ),
                           )
-                        : InteractiveIslandPainterWidget(
-                            gameState: _gameState!,
-                            onTapCell: _handleCellTap,
-                            onPaintCell: _handleCellPaint,
-                            iconCache: _iconCache,
-                            activeTool: _activeTool,
-                            bubbleImage: _bubbleImage,
-                          ),
+                        : _gameState == null
+                            ? const Center(
+                                child: Text(
+                                  "Sélectionnez ou créez un monde pour démarrer la simulation",
+                                  style: TextStyle(
+                                    color: Colors.white,
+                                    fontSize: 16,
+                                    fontWeight: FontWeight.bold,
+                                    shadows: [
+                                      Shadow(
+                                        offset: Offset(1.0, 1.0),
+                                        blurRadius: 4.0,
+                                        color: Colors.black,
+                                      ),
+                                    ],
+                                  ),
+                                  textAlign: TextAlign.center,
+                                ),
+                              )
+                            : InteractiveIslandPainterWidget(
+                                key: ValueKey('${_selectedSimId}_${_gameState!['width']}_${_gameState!['height']}'),
+                                gameState: _gameState!,
+                                onTapCell: _handleCellTap,
+                                onPaintCell: _handleCellPaint,
+                                iconCache: _iconCache,
+                                activeTool: _activeTool,
+                                bubbleImage: _bubbleImage,
+                              ),
                   ),
                   // Chevron flottant pour ouvrir le panneau si fermé
                   if (!_showStatsPanel && _gameState != null)
@@ -1419,7 +1782,20 @@ def generer_grille(width, height):
                     style: const TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
                   ),
                 ),
-                if (isComponentMode)
+                if (isComponentMode) ...[
+                  IconButton(
+                    icon: Icon(
+                      _debugMode ? Icons.bug_report : Icons.bug_report_outlined,
+                      color: _debugMode ? Colors.amberAccent : Colors.grey,
+                      size: 20,
+                    ),
+                    tooltip: 'Mode Debug',
+                    onPressed: () {
+                      setState(() {
+                        _debugMode = !_debugMode;
+                      });
+                    },
+                  ),
                   IconButton(
                     icon: const Icon(Icons.public, size: 20),
                     tooltip: 'Statistiques globales',
@@ -1431,6 +1807,7 @@ def generer_grille(width, height):
                       });
                     },
                   ),
+                ],
               ],
             ),
           ),
@@ -1528,10 +1905,15 @@ def generer_grille(width, height):
       type = rawValue[1].toString().toLowerCase();
     }
 
+    final String id = _selectedStatsComponentId ?? '';
     Widget contentWidget;
 
     switch (type) {
       case 'progress_bar':
+      case 'progress_bar_pink':
+      case 'progress_bar_rose':
+      case 'progress_bar_red':
+      case 'progress_bar_rouge':
         double percentage = 0.0;
         String textVal = '0/0';
         if (val is List && val.length == 2) {
@@ -1544,70 +1926,200 @@ def generer_grille(width, height):
             textVal = '${val[0]}/${val[1]}';
           } catch (_) {}
         }
-        contentWidget = Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            Row(
-              mainAxisAlignment: MainAxisAlignment.spaceBetween,
-              children: [
-                Text(
-                  label,
-                  style: const TextStyle(color: Colors.grey, fontSize: 12),
-                ),
-                Text(
-                  textVal,
-                  style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 12, color: Colors.tealAccent),
-                ),
-              ],
-            ),
-            const SizedBox(height: 6),
-            ClipRRect(
-              borderRadius: BorderRadius.circular(4),
-              child: LinearProgressIndicator(
-                value: percentage,
-                backgroundColor: Colors.teal.shade900,
-                color: Colors.tealAccent,
-                minHeight: 8,
+
+        Color barColor = Colors.tealAccent;
+        Color bgColor = Colors.teal.shade900;
+        Color textColor = Colors.tealAccent;
+
+        if (type == 'progress_bar_pink' || type == 'progress_bar_rose') {
+          barColor = Colors.pinkAccent;
+          bgColor = Colors.pink.shade900;
+          textColor = Colors.pinkAccent;
+        } else if (type == 'progress_bar_red' || type == 'progress_bar_rouge') {
+          barColor = Colors.redAccent;
+          bgColor = Colors.red.shade900;
+          textColor = Colors.redAccent;
+        }
+
+        if (_debugMode && val is List && val.length == 2) {
+          double current = 0.0;
+          double maxVal = 100.0;
+          try {
+            current = double.parse(val[0].toString());
+            maxVal = double.parse(val[1].toString());
+          } catch (_) {}
+          contentWidget = Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  Text(
+                    label,
+                    style: const TextStyle(color: Colors.grey, fontSize: 12),
+                  ),
+                  Text(
+                    '${current.round()}/${maxVal.round()}',
+                    style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12, color: textColor),
+                  ),
+                ],
               ),
-            ),
-          ],
-        );
+              const SizedBox(height: 4),
+              SliderTheme(
+                data: SliderTheme.of(context).copyWith(
+                  trackHeight: 4,
+                  thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 6),
+                  overlayShape: const RoundSliderOverlayShape(overlayRadius: 12),
+                ),
+                child: Slider(
+                  value: current.clamp(0.0, maxVal),
+                  min: 0,
+                  max: maxVal,
+                  activeColor: barColor,
+                  inactiveColor: bgColor,
+                  onChanged: (newVal) {
+                    setState(() {
+                      if (_cachedComponentStats != null && _cachedComponentStats!['stats'] != null) {
+                        final st = _cachedComponentStats!['stats'][label];
+                        if (st is List && st.length == 2 && st[0] is List) {
+                          st[0][0] = newVal.round();
+                        }
+                      }
+                    });
+                  },
+                  onChangeEnd: (newVal) {
+                    if (id.isNotEmpty) {
+                      _updateComponentStat(id, label, newVal.round());
+                    }
+                  },
+                ),
+              ),
+            ],
+          );
+        } else {
+          contentWidget = Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  Text(
+                    label,
+                    style: const TextStyle(color: Colors.grey, fontSize: 12),
+                  ),
+                  Text(
+                    textVal,
+                    style: TextStyle(fontWeight: FontWeight.bold, fontSize: 12, color: textColor),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 6),
+              ClipRRect(
+                borderRadius: BorderRadius.circular(4),
+                child: LinearProgressIndicator(
+                  value: percentage,
+                  backgroundColor: bgColor,
+                  color: barColor,
+                  minHeight: 8,
+                ),
+              ),
+            ],
+          );
+        }
         break;
 
       case 'percent':
       case 'percentage':
         double percentage = 0.0;
         try {
-          percentage = (double.parse(val.toString()) / 100.0).clamp(0.0, 1.0);
+          percentage = double.parse(val.toString());
         } catch (_) {}
-        contentWidget = Column(
-          crossAxisAlignment: CrossAxisAlignment.stretch,
-          children: [
-            Row(
-              mainAxisAlignment: MainAxisAlignment.spaceBetween,
-              children: [
-                Text(
-                  label,
-                  style: const TextStyle(color: Colors.grey, fontSize: 12),
-                ),
-                Text(
-                  '$val%',
-                  style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 12, color: Colors.tealAccent),
-                ),
-              ],
-            ),
-            const SizedBox(height: 6),
-            ClipRRect(
-              borderRadius: BorderRadius.circular(4),
-              child: LinearProgressIndicator(
-                value: percentage,
-                backgroundColor: Colors.teal.shade900,
-                color: Colors.tealAccent.shade400,
-                minHeight: 8,
+
+        if (_debugMode) {
+          contentWidget = Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  Text(
+                    label,
+                    style: const TextStyle(color: Colors.grey, fontSize: 12),
+                  ),
+                  Text(
+                    '${percentage.round()}%',
+                    style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 12, color: Colors.tealAccent),
+                  ),
+                ],
               ),
-            ),
-          ],
-        );
+              const SizedBox(height: 4),
+              SliderTheme(
+                data: SliderTheme.of(context).copyWith(
+                  trackHeight: 4,
+                  thumbShape: const RoundSliderThumbShape(enabledThumbRadius: 6),
+                  overlayShape: const RoundSliderOverlayShape(overlayRadius: 12),
+                ),
+                child: Slider(
+                  value: percentage.clamp(0.0, 100.0),
+                  min: 0,
+                  max: 100,
+                  activeColor: Colors.tealAccent,
+                  inactiveColor: Colors.teal.shade900,
+                  onChanged: (newVal) {
+                    setState(() {
+                      if (_cachedComponentStats != null && _cachedComponentStats!['stats'] != null) {
+                        final st = _cachedComponentStats!['stats'][label];
+                        if (st is List && st.length == 2) {
+                          st[0] = newVal.round();
+                        } else {
+                          _cachedComponentStats!['stats'][label] = newVal.round();
+                        }
+                      }
+                    });
+                  },
+                  onChangeEnd: (newVal) {
+                    if (id.isNotEmpty) {
+                      _updateComponentStat(id, label, newVal.round());
+                    }
+                  },
+                ),
+              ),
+            ],
+          );
+        } else {
+          double percentageVal = 0.0;
+          try {
+            percentageVal = (percentage / 100.0).clamp(0.0, 1.0);
+          } catch (_) {}
+          contentWidget = Column(
+            crossAxisAlignment: CrossAxisAlignment.stretch,
+            children: [
+              Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                children: [
+                  Text(
+                    label,
+                    style: const TextStyle(color: Colors.grey, fontSize: 12),
+                  ),
+                  Text(
+                    '$val%',
+                    style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 12, color: Colors.tealAccent),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 6),
+              ClipRRect(
+                borderRadius: BorderRadius.circular(4),
+                child: LinearProgressIndicator(
+                  value: percentageVal,
+                  backgroundColor: Colors.teal.shade900,
+                  color: Colors.tealAccent.shade400,
+                  minHeight: 8,
+                ),
+              ),
+            ],
+          );
+        }
         break;
 
       case 'position':
@@ -1616,17 +2128,29 @@ def generer_grille(width, height):
             const Icon(Icons.location_on, color: Colors.tealAccent, size: 16),
             const SizedBox(width: 6),
             Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.spaceBetween,
                 children: [
-                  Text(
-                    label,
-                    style: const TextStyle(color: Colors.grey, fontSize: 10),
+                  Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        label,
+                        style: const TextStyle(color: Colors.grey, fontSize: 10),
+                      ),
+                      Text(
+                        val.toString(),
+                        style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13, color: Colors.white),
+                      ),
+                    ],
                   ),
-                  Text(
-                    val.toString(),
-                    style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13, color: Colors.white),
-                  ),
+                  if (_debugMode)
+                    IconButton(
+                      icon: const Icon(Icons.edit, size: 16, color: Colors.amberAccent),
+                      padding: EdgeInsets.zero,
+                      constraints: const BoxConstraints(),
+                      onPressed: () => _showEditStatDialog(label, val),
+                    ),
                 ],
               ),
             ),
@@ -1644,17 +2168,30 @@ def generer_grille(width, height):
               label,
               style: const TextStyle(color: Colors.grey, fontSize: 12),
             ),
-            Container(
-              padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
-              decoration: BoxDecoration(
-                color: Colors.teal.shade900.withValues(alpha: 0.4),
-                borderRadius: BorderRadius.circular(12),
-                border: Border.all(color: Colors.teal.shade800),
-              ),
-              child: Text(
-                val.toString(),
-                style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 12, color: Colors.tealAccent),
-              ),
+            Row(
+              children: [
+                Container(
+                  padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 2),
+                  decoration: BoxDecoration(
+                    color: Colors.teal.shade900.withValues(alpha: 0.4),
+                    borderRadius: BorderRadius.circular(12),
+                    border: Border.all(color: Colors.teal.shade800),
+                  ),
+                  child: Text(
+                    val.toString(),
+                    style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 12, color: Colors.tealAccent),
+                  ),
+                ),
+                if (_debugMode) ...[
+                  const SizedBox(width: 6),
+                  IconButton(
+                    icon: const Icon(Icons.edit, size: 14, color: Colors.amberAccent),
+                    padding: EdgeInsets.zero,
+                    constraints: const BoxConstraints(),
+                    onPressed: () => _showEditStatDialog(label, val),
+                  ),
+                ],
+              ],
             ),
           ],
         );
@@ -1670,11 +2207,22 @@ def generer_grille(width, height):
               label,
               style: const TextStyle(color: Colors.grey, fontSize: 12),
             ),
-            Icon(
-              isTrue ? Icons.check_circle : Icons.cancel,
-              color: isTrue ? Colors.greenAccent : Colors.redAccent,
-              size: 18,
-            ),
+            if (_debugMode)
+              Switch(
+                value: isTrue,
+                activeThumbColor: Colors.greenAccent,
+                onChanged: (newVal) {
+                  if (id.isNotEmpty) {
+                    _updateComponentStat(id, label, newVal);
+                  }
+                },
+              )
+            else
+              Icon(
+                isTrue ? Icons.check_circle : Icons.cancel,
+                color: isTrue ? Colors.greenAccent : Colors.redAccent,
+                size: 18,
+              ),
           ],
         );
         break;
@@ -1688,9 +2236,31 @@ def generer_grille(width, height):
               label,
               style: const TextStyle(color: Colors.grey, fontSize: 12),
             ),
-            Text(
-              val.toString(),
-              style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 12, color: Colors.white),
+            const SizedBox(width: 8),
+            Expanded(
+              child: Row(
+                mainAxisAlignment: MainAxisAlignment.end,
+                children: [
+                  Flexible(
+                    child: Text(
+                      val.toString(),
+                      textAlign: TextAlign.end,
+                      overflow: TextOverflow.ellipsis,
+                      maxLines: 1,
+                      style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 12, color: Colors.white),
+                    ),
+                  ),
+                  if (_debugMode) ...[
+                    const SizedBox(width: 6),
+                    IconButton(
+                      icon: const Icon(Icons.edit, size: 14, color: Colors.amberAccent),
+                      padding: EdgeInsets.zero,
+                      constraints: const BoxConstraints(),
+                      onPressed: () => _showEditStatDialog(label, val),
+                    ),
+                  ],
+                ],
+              ),
             ),
           ],
         );
@@ -1746,6 +2316,9 @@ def generer_grille(width, height):
         ),
         const SizedBox(height: 8),
         _buildStatItem('Total d\'entités vivantes', totalEntities.toString()),
+        _buildStatItem('Naissances cumulées', (globalStats["Naissances"] ?? 0).toString()),
+        _buildStatItem('Décès cumulés', (globalStats["Décès"] ?? 0).toString()),
+        _buildStatItem('Meurtres cumulés 💀', (globalStats["Meurtres"] ?? 0).toString()),
         const SizedBox(height: 12),
         const Text(
           'Distribution des Espèces',
@@ -1784,6 +2357,54 @@ def generer_grille(width, height):
               'Aucune entité vivante sur la carte.',
               style: TextStyle(color: Colors.grey, fontSize: 11, fontStyle: FontStyle.italic),
               textAlign: TextAlign.center,
+            ),
+          ),
+        const SizedBox(height: 20),
+        const Text(
+          'Graphe Social & Clustering (MMSB)',
+          style: TextStyle(fontWeight: FontWeight.bold, fontSize: 13, color: Colors.tealAccent),
+        ),
+        const SizedBox(height: 8),
+        Center(
+          child: Container(
+            constraints: const BoxConstraints(maxHeight: 250),
+            child: Image.network(
+              '${ApiClient.baseUrl}/api/simulations/${_selectedSimId ?? ''}/mmsb/plot?tick=${_gameState?["tick"] ?? 0}',
+              key: ValueKey('mmsb_plot_${_gameState?["tick"] ?? 0}'),
+              fit: BoxFit.contain,
+              errorBuilder: (context, error, stackTrace) {
+                return const Padding(
+                  padding: EdgeInsets.symmetric(vertical: 12.0),
+                  child: Text(
+                    'Graphe social indisponible (moins de 2 humains ou API inactive).',
+                    style: TextStyle(color: Colors.grey, fontSize: 11, fontStyle: FontStyle.italic),
+                    textAlign: TextAlign.center,
+                  ),
+                );
+              },
+            ),
+          ),
+        ),
+        const SizedBox(height: 8),
+        if (_selectedSimId != null)
+          Center(
+            child: ElevatedButton.icon(
+              icon: const Icon(Icons.fullscreen, size: 16),
+              label: const Text('Explorer le graphe interactif (Popup)', style: TextStyle(fontSize: 11)),
+              onPressed: () {
+                showDialog(
+                  context: context,
+                  builder: (context) => InteractiveSocialGraphDialog(
+                    simId: _selectedSimId!,
+                    onInspectNode: (nodeId) {
+                      setState(() {
+                        _selectedStatsComponentId = nodeId;
+                        _showStatsPanel = true;
+                      });
+                    },
+                  ),
+                );
+              },
             ),
           ),
         const SizedBox(height: 24),
@@ -1849,10 +2470,15 @@ def generer_grille(width, height):
                 Row(
                   mainAxisAlignment: MainAxisAlignment.spaceBetween,
                   children: [
-                    Text(
-                      '$speaker ➔ $listener',
-                      style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 11, color: Colors.tealAccent),
+                    Expanded(
+                      child: Text(
+                        '$speaker ➔ $listener',
+                        overflow: TextOverflow.ellipsis,
+                        maxLines: 1,
+                        style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 11, color: Colors.tealAccent),
+                      ),
                     ),
+                    const SizedBox(width: 8),
                     Row(
                       children: [
                         if (d['intime'] == true) ...[
@@ -1923,4 +2549,420 @@ def generer_grille(width, height):
       ),
     );
   }
+
+  Future<void> _updateComponentStat(String compId, String key, dynamic value) async {
+    if (_selectedSimId == null) return;
+    try {
+      final success = await ApiClient.updateComponentStat(_selectedSimId!, compId, key, value);
+      if (success) {
+        _fetchGameState();
+      } else {
+        if (!mounted) return;
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Échec de la mise à jour de la statistique')),
+        );
+      }
+    } catch (e) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('Erreur: $e')),
+      );
+    }
+  }
+
+  void _showEditStatDialog(String label, dynamic currentValue) {
+    final textController = TextEditingController(text: currentValue.toString());
+    showDialog(
+      context: context,
+      builder: (context) {
+        return AlertDialog(
+          title: Text('Modifier $label'),
+          content: TextField(
+            controller: textController,
+            decoration: const InputDecoration(
+              hintText: 'Entrez la nouvelle valeur',
+            ),
+            autofocus: true,
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text('Annuler'),
+            ),
+            ElevatedButton(
+              onPressed: () {
+                final newValue = textController.text.trim();
+                Navigator.pop(context);
+                if (_selectedStatsComponentId != null) {
+                  _updateComponentStat(_selectedStatsComponentId!, label, newValue);
+                }
+              },
+              child: const Text('Enregistrer'),
+            ),
+          ],
+        );
+      },
+    );
+  }
 }
+
+class InteractiveSocialGraphDialog extends StatefulWidget {
+  final String simId;
+  final Function(String nodeId)? onInspectNode;
+  const InteractiveSocialGraphDialog({super.key, required this.simId, this.onInspectNode});
+
+  @override
+  State<InteractiveSocialGraphDialog> createState() => _InteractiveSocialGraphDialogState();
+}
+
+class _InteractiveSocialGraphDialogState extends State<InteractiveSocialGraphDialog> {
+  bool _loading = true;
+  List<dynamic> _nodes = [];
+  List<dynamic> _links = [];
+  String? _errorMsg;
+  Map<String, dynamic>? _selectedNode;
+
+  @override
+  void initState() {
+    super.initState();
+    _fetchGraphData();
+  }
+
+  Future<void> _fetchGraphData() async {
+    try {
+      final response = await http.get(Uri.parse('${ApiClient.baseUrl}/api/simulations/${widget.simId}/mmsb/data'));
+      if (!mounted) return;
+      if (response.statusCode == 200) {
+        final data = json.decode(response.body);
+        setState(() {
+          _nodes = data['nodes'] ?? [];
+          _links = data['links'] ?? [];
+          _loading = false;
+        });
+      } else {
+        setState(() {
+          _errorMsg = "Erreur HTTP : ${response.statusCode}";
+          _loading = false;
+        });
+      }
+    } catch (e) {
+      if (!mounted) return;
+      setState(() {
+        _errorMsg = "Impossible de se connecter à l'API.";
+        _loading = false;
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Dialog(
+      backgroundColor: const Color(0xFF1E1E1E),
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+      child: Container(
+        width: 600,
+        height: 600,
+        padding: const EdgeInsets.all(16.0),
+        child: Column(
+          crossAxisAlignment: CrossAxisAlignment.stretch,
+          children: [
+            Row(
+              mainAxisAlignment: MainAxisAlignment.spaceBetween,
+              children: [
+                const Text(
+                  'Graphe Social MMSB Interactif',
+                  style: TextStyle(fontWeight: FontWeight.bold, fontSize: 16, color: Colors.tealAccent),
+                ),
+                IconButton(
+                  icon: const Icon(Icons.close, color: Colors.white70),
+                  onPressed: () => Navigator.pop(context),
+                )
+              ],
+            ),
+            const SizedBox(height: 8),
+            Container(
+              padding: const EdgeInsets.all(8.0),
+              decoration: BoxDecoration(
+                color: Colors.black26,
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: const Row(
+                mainAxisAlignment: MainAxisAlignment.spaceAround,
+                children: [
+                  Row(
+                    children: [
+                      Icon(Icons.circle, color: Colors.red, size: 10),
+                      SizedBox(width: 4),
+                      Text('Groupe 0', style: TextStyle(fontSize: 10, color: Colors.white70)),
+                    ],
+                  ),
+                  Row(
+                    children: [
+                      Icon(Icons.circle, color: Colors.blue, size: 10),
+                      SizedBox(width: 4),
+                      Text('Groupe 1', style: TextStyle(fontSize: 10, color: Colors.white70)),
+                    ],
+                  ),
+                  Row(
+                    children: [
+                      Icon(Icons.circle, color: Color(0xFF800080), size: 10),
+                      SizedBox(width: 4),
+                      Text('Appartenance Mixte', style: TextStyle(fontSize: 10, color: Colors.white70)),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(height: 16),
+            Expanded(
+              child: Container(
+                decoration: BoxDecoration(
+                  color: Colors.black38,
+                  borderRadius: BorderRadius.circular(12),
+                  border: Border.all(color: Colors.white10),
+                ),
+                child: _buildGraphContent(),
+              ),
+            ),
+            if (_selectedNode != null) ...[
+              const SizedBox(height: 12),
+              Container(
+                padding: const EdgeInsets.all(12.0),
+                decoration: BoxDecoration(
+                  color: Colors.teal.withOpacity(0.08),
+                  borderRadius: BorderRadius.circular(10),
+                  border: Border.all(color: Colors.tealAccent.withOpacity(0.2)),
+                ),
+                child: Row(
+                  children: [
+                    Expanded(
+                      child: Column(
+                        crossAxisAlignment: CrossAxisAlignment.start,
+                        children: [
+                          Text(
+                            "Humain ${_selectedNode!['label']}",
+                            style: const TextStyle(fontWeight: FontWeight.bold, fontSize: 13, color: Colors.tealAccent),
+                          ),
+                          const SizedBox(height: 4),
+                          Text(
+                            "Probabilité Groupe 0 : ${(_selectedNode!['membership'][0] * 100).toStringAsFixed(1)}%\n"
+                            "Probabilité Groupe 1 : ${(_selectedNode!['membership'][1] * 100).toStringAsFixed(1)}%",
+                            style: const TextStyle(fontSize: 11, color: Colors.white70),
+                          ),
+                        ],
+                      ),
+                    ),
+                    ElevatedButton.icon(
+                      icon: const Icon(Icons.search, size: 14),
+                      label: const Text('Inspecter', style: TextStyle(fontSize: 11)),
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: Colors.teal.shade800,
+                        foregroundColor: Colors.white,
+                      ),
+                      onPressed: () {
+                        Navigator.pop(context);
+                        if (widget.onInspectNode != null) {
+                          widget.onInspectNode!(_selectedNode!['id']);
+                        }
+                      },
+                    ),
+                  ],
+                ),
+              ),
+            ],
+            const SizedBox(height: 12),
+            const Text(
+              'Astuce : Utilisez le pincement pour zoomer, glissez pour déplacer, cliquez sur un nœud pour afficher ses détails.',
+              style: TextStyle(fontSize: 10, color: Colors.grey, fontStyle: FontStyle.italic),
+              textAlign: TextAlign.center,
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildGraphContent() {
+    if (_loading) {
+      return const Center(child: CircularProgressIndicator());
+    }
+    if (_errorMsg != null) {
+      return Center(child: Text(_errorMsg!, style: const TextStyle(color: Colors.red)));
+    }
+    if (_nodes.isEmpty) {
+      return const Center(
+        child: Text(
+          'Pas assez de données pour générer le graphe (min. 2 humains).',
+          style: TextStyle(color: Colors.grey),
+        ),
+      );
+    }
+
+    return LayoutBuilder(
+      builder: (context, constraints) {
+        final double width = constraints.maxWidth;
+        final double height = constraints.maxHeight;
+
+        // Calculer les bornes min/max pour le centrage
+        double minX = -1.0;
+        double maxX = 1.0;
+        double minY = -1.0;
+        double maxY = 1.0;
+
+        if (_nodes.isNotEmpty) {
+          minX = _nodes.map((n) => (n['x'] as num).toDouble()).reduce((a, b) => a < b ? a : b);
+          maxX = _nodes.map((n) => (n['x'] as num).toDouble()).reduce((a, b) => a > b ? a : b);
+          minY = _nodes.map((n) => (n['y'] as num).toDouble()).reduce((a, b) => a < b ? a : b);
+          maxY = _nodes.map((n) => (n['y'] as num).toDouble()).reduce((a, b) => a > b ? a : b);
+        }
+
+        double widthRange = (maxX - minX).abs();
+        double heightRange = (maxY - minY).abs();
+        if (widthRange == 0) widthRange = 1.0;
+        if (heightRange == 0) heightRange = 1.0;
+
+        minX -= widthRange * 0.15;
+        maxX += widthRange * 0.15;
+        minY -= heightRange * 0.15;
+        maxY += heightRange * 0.15;
+
+        Offset getOffset(double x, double y) {
+          final double cx = ((x - minX) / (maxX - minX)) * width;
+          final double cy = (1.0 - ((y - minY) / (maxY - minY))) * height;
+          return Offset(cx, cy);
+        }
+
+        final Map<String, Offset> nodeOffsets = {};
+        for (var node in _nodes) {
+          final double nx = (node['x'] as num).toDouble();
+          final double ny = (node['y'] as num).toDouble();
+          nodeOffsets[node['id']] = getOffset(nx, ny);
+        }
+
+        return GestureDetector(
+          onTapUp: (details) {
+            final Offset localPos = details.localPosition;
+            String? clickedNodeId;
+            for (var entry in nodeOffsets.entries) {
+              if ((localPos - entry.value).distance <= 20.0) {
+                clickedNodeId = entry.key;
+                break;
+              }
+            }
+            if (clickedNodeId != null) {
+              final node = _nodes.firstWhere((n) => n['id'] == clickedNodeId);
+              setState(() {
+                _selectedNode = node;
+              });
+            } else {
+              setState(() {
+                _selectedNode = null;
+              });
+            }
+          },
+          child: InteractiveViewer(
+            boundaryMargin: const EdgeInsets.all(100.0),
+            minScale: 0.1,
+            maxScale: 4.0,
+            child: SizedBox(
+              width: width,
+              height: height,
+              child: CustomPaint(
+                painter: GraphPainter(
+                  nodes: _nodes,
+                  links: _links,
+                  nodeOffsets: nodeOffsets,
+                  selectedNodeId: _selectedNode != null ? _selectedNode!['id'] : null,
+                ),
+              ),
+            ),
+          ),
+        );
+      },
+    );
+  }
+}
+
+class GraphPainter extends CustomPainter {
+  final List<dynamic> nodes;
+  final List<dynamic> links;
+  final Map<String, Offset> nodeOffsets;
+  final String? selectedNodeId;
+
+  GraphPainter({
+    required this.nodes,
+    required this.links,
+    required this.nodeOffsets,
+    this.selectedNodeId,
+  });
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final Paint linePaint = Paint()
+      ..color = Colors.white.withOpacity(0.3)
+      ..strokeWidth = 2.0;
+
+    for (var link in links) {
+      final String source = link['source'];
+      final String target = link['target'];
+      if (nodeOffsets.containsKey(source) && nodeOffsets.containsKey(target)) {
+        canvas.drawLine(nodeOffsets[source]!, nodeOffsets[target]!, linePaint);
+      }
+    }
+
+    for (var node in nodes) {
+      final String nId = node['id'];
+      if (!nodeOffsets.containsKey(nId)) continue;
+      final Offset offset = nodeOffsets[nId]!;
+
+      final List<dynamic> membership = node['membership'] ?? [0.5, 0.5];
+      final double p0 = (membership[0] as num).toDouble();
+      final double p1 = (membership[1] as num).toDouble();
+
+      final Color nodeColor = Color.fromARGB(
+        240,
+        (p0 * 255).round().clamp(0, 255),
+        25,
+        (p1 * 255).round().clamp(0, 255),
+      );
+
+      if (selectedNodeId == nId) {
+        canvas.drawCircle(
+          offset,
+          18.0,
+          Paint()
+            ..color = Colors.tealAccent
+            ..style = PaintingStyle.stroke
+            ..strokeWidth = 2.5,
+        );
+      }
+
+      canvas.drawCircle(offset, 14.0, Paint()..color = Colors.white);
+      canvas.drawCircle(offset, 12.0, Paint()..color = nodeColor);
+
+      final String label = node['label'] ?? '';
+      final TextPainter textPainter = TextPainter(
+        text: TextSpan(
+          text: label,
+          style: const TextStyle(
+            color: Colors.white,
+            fontSize: 8.0,
+            fontWeight: FontWeight.bold,
+            shadows: [
+              Shadow(blurRadius: 4.0, color: Colors.black, offset: Offset(1, 1))
+            ],
+          ),
+        ),
+        textDirection: TextDirection.ltr,
+      );
+      textPainter.layout();
+      canvas.translate(offset.dx - textPainter.width / 2, offset.dy - textPainter.height / 2);
+      textPainter.paint(canvas, Offset.zero);
+      canvas.translate(-(offset.dx - textPainter.width / 2), -(offset.dy - textPainter.height / 2));
+    }
+  }
+
+  @override
+  bool shouldRepaint(covariant CustomPainter oldDelegate) => true;
+}
+
